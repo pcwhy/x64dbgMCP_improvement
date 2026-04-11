@@ -17,6 +17,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Ensure deps directory exists
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/deps"
+
       - name: Configure CMake superbuild
         run: >
           cmake -S "${{ github.workspace }}"
