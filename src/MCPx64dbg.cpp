@@ -31,6 +31,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
+#include <deque>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -57,11 +59,31 @@ int g_pluginHandle;
 HANDLE g_httpServerThread = NULL;
 bool g_httpServerRunning = false;
 int g_httpPort = DEFAULT_PORT;
+std::string g_httpHost = "127.0.0.1";
 std::mutex g_httpMutex;
 SOCKET g_serverSocket = INVALID_SOCKET;
 
+enum class DebugAction {
+    Run,
+    Pause,
+    Stop,
+    StepIn,
+    StepOver,
+    StepOut
+};
+
+HANDLE g_debugActionThread = NULL;
+HANDLE g_debugActionEvent = NULL;
+bool g_debugActionRunning = false;
+std::mutex g_debugActionMutex;
+std::deque<DebugAction> g_debugActionQueue;
+
 bool startHttpServer();
 void stopHttpServer();
+bool startDebugActionWorker();
+void stopDebugActionWorker();
+bool queueDebugAction(DebugAction action);
+DWORD WINAPI DebugActionThread(LPVOID lpParam);
 DWORD WINAPI HttpServerThread(LPVOID lpParam);
 std::string readHttpRequest(SOCKET clientSocket);
 void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& contentType, const std::string& responseBody);
@@ -69,9 +91,12 @@ void parseHttpRequest(const std::string& request, std::string& method, std::stri
 std::unordered_map<std::string, std::string> parseQueryParams(const std::string& query);
 std::string urlDecode(const std::string& str);
 std::string escapeJsonString(const char* str);
+bool resolveListenAddress(const std::string& host, sockaddr_in& serverAddr);
+std::string debugActionName(DebugAction action);
 
 bool cbEnableHttpServer(int argc, char* argv[]);
 bool cbSetHttpPort(int argc, char* argv[]);
+bool cbSetHttpHost(int argc, char* argv[]);
 void registerCommands();
 
 bool pluginInit(PLUG_INITSTRUCT* initStruct) {
@@ -82,8 +107,11 @@ bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     
     _plugin_logputs("x64dbg HTTP Server plugin loading...");
     registerCommands();
+    if (!startDebugActionWorker()) {
+        _plugin_logputs("Failed to start debug action worker!");
+    }
     if (startHttpServer()) {
-        _plugin_logprintf("x64dbg HTTP Server started on port %d\n", g_httpPort);
+        _plugin_logprintf("x64dbg HTTP Server started on %s:%d\n", g_httpHost.c_str(), g_httpPort);
     } else {
         _plugin_logputs("Failed to start HTTP server!");
     }
@@ -95,6 +123,7 @@ bool pluginInit(PLUG_INITSTRUCT* initStruct) {
 void pluginStop() {
     _plugin_logputs("Stopping x64dbg HTTP Server...");
     stopHttpServer();
+    stopDebugActionWorker();
     _plugin_logputs("x64dbg HTTP Server stopped.");
 }
 
@@ -115,34 +144,163 @@ extern "C" __declspec(dllexport) void plugsetup(PLUG_SETUPSTRUCT* setupStruct) {
 }
 
 bool startHttpServer() {
-    std::lock_guard<std::mutex> lock(g_httpMutex);
-    if (g_httpServerRunning) {
-        stopHttpServer();
+    {
+        std::lock_guard<std::mutex> lock(g_httpMutex);
+        if (g_httpServerRunning) {
+            return true;
+        }
+        g_httpServerRunning = true;
     }
     g_httpServerThread = CreateThread(NULL, 0, HttpServerThread, NULL, 0, NULL);
     if (g_httpServerThread == NULL) {
         _plugin_logputs("Failed to create HTTP server thread");
+        std::lock_guard<std::mutex> lock(g_httpMutex);
+        g_httpServerRunning = false;
         return false;
     }
-    
-    g_httpServerRunning = true;
     return true;
 }
 
 void stopHttpServer() {
-    std::lock_guard<std::mutex> lock(g_httpMutex);
-    if (g_httpServerRunning) {
+    HANDLE thread = NULL;
+    {
+        std::lock_guard<std::mutex> lock(g_httpMutex);
         g_httpServerRunning = false;
         if (g_serverSocket != INVALID_SOCKET) {
             closesocket(g_serverSocket);
             g_serverSocket = INVALID_SOCKET;
         }
-        if (g_httpServerThread != NULL) {
-            WaitForSingleObject(g_httpServerThread, 1000);
-            CloseHandle(g_httpServerThread);
-            g_httpServerThread = NULL;
+        thread = g_httpServerThread;
+        g_httpServerThread = NULL;
+    }
+    if (thread != NULL) {
+        WaitForSingleObject(thread, 1000);
+        CloseHandle(thread);
+    }
+}
+
+std::string debugActionName(DebugAction action) {
+    switch (action) {
+        case DebugAction::Run: return "Run";
+        case DebugAction::Pause: return "Pause";
+        case DebugAction::Stop: return "Stop";
+        case DebugAction::StepIn: return "StepIn";
+        case DebugAction::StepOver: return "StepOver";
+        case DebugAction::StepOut: return "StepOut";
+    }
+    return "Unknown";
+}
+
+bool startDebugActionWorker() {
+    std::lock_guard<std::mutex> lock(g_debugActionMutex);
+    if (g_debugActionRunning) {
+        return true;
+    }
+    g_debugActionEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (g_debugActionEvent == NULL) {
+        _plugin_logputs("Failed to create debug action event");
+        return false;
+    }
+    g_debugActionRunning = true;
+    g_debugActionThread = CreateThread(NULL, 0, DebugActionThread, NULL, 0, NULL);
+    if (g_debugActionThread == NULL) {
+        _plugin_logputs("Failed to create debug action thread");
+        CloseHandle(g_debugActionEvent);
+        g_debugActionEvent = NULL;
+        g_debugActionRunning = false;
+        return false;
+    }
+    return true;
+}
+
+void stopDebugActionWorker() {
+    HANDLE thread = NULL;
+    HANDLE event = NULL;
+    {
+        std::lock_guard<std::mutex> lock(g_debugActionMutex);
+        g_debugActionRunning = false;
+        thread = g_debugActionThread;
+        event = g_debugActionEvent;
+        if (event != NULL) {
+            SetEvent(event);
         }
     }
+    if (thread != NULL) {
+        WaitForSingleObject(thread, 1000);
+        CloseHandle(thread);
+    }
+    if (event != NULL) {
+        CloseHandle(event);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_debugActionMutex);
+        g_debugActionThread = NULL;
+        g_debugActionEvent = NULL;
+        g_debugActionQueue.clear();
+    }
+}
+
+bool queueDebugAction(DebugAction action) {
+    std::lock_guard<std::mutex> lock(g_debugActionMutex);
+    if (!g_debugActionRunning || g_debugActionEvent == NULL) {
+        return false;
+    }
+    g_debugActionQueue.push_back(action);
+    SetEvent(g_debugActionEvent);
+    return true;
+}
+
+DWORD WINAPI DebugActionThread(LPVOID lpParam) {
+    while (true) {
+        HANDLE event = NULL;
+        {
+            std::lock_guard<std::mutex> lock(g_debugActionMutex);
+            event = g_debugActionEvent;
+            if (!g_debugActionRunning && g_debugActionQueue.empty()) {
+                break;
+            }
+        }
+        if (event != NULL) {
+            WaitForSingleObject(event, 100);
+        } else {
+            Sleep(100);
+        }
+
+        while (true) {
+            DebugAction action;
+            {
+                std::lock_guard<std::mutex> lock(g_debugActionMutex);
+                if (g_debugActionQueue.empty()) {
+                    break;
+                }
+                action = g_debugActionQueue.front();
+                g_debugActionQueue.pop_front();
+            }
+
+            _plugin_logprintf("Executing async debug action: %s\n", debugActionName(action).c_str());
+            switch (action) {
+                case DebugAction::Run:
+                    Script::Debug::Run();
+                    break;
+                case DebugAction::Pause:
+                    Script::Debug::Pause();
+                    break;
+                case DebugAction::Stop:
+                    Script::Debug::Stop();
+                    break;
+                case DebugAction::StepIn:
+                    Script::Debug::StepIn();
+                    break;
+                case DebugAction::StepOver:
+                    Script::Debug::StepOver();
+                    break;
+                case DebugAction::StepOut:
+                    Script::Debug::StepOut();
+                    break;
+            }
+        }
+    }
+    return 0;
 }
 
 std::string urlDecode(const std::string& str) {
@@ -204,37 +362,66 @@ std::string escapeJsonString(const char* str) {
     return result;
 }
 
+bool resolveListenAddress(const std::string& host, sockaddr_in& serverAddr) {
+    if (host == "0.0.0.0" || host == "*" || host == "any") {
+        serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        return true;
+    }
+    if (host == "127.0.0.1" || host == "localhost") {
+        serverAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        return true;
+    }
+    return inet_pton(AF_INET, host.c_str(), &serverAddr.sin_addr) == 1;
+}
+
+void markHttpServerStopped() {
+    std::lock_guard<std::mutex> lock(g_httpMutex);
+    g_httpServerRunning = false;
+    g_serverSocket = INVALID_SOCKET;
+}
+
 DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     WSADATA wsaData;
     int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (result != 0) {
         _plugin_logprintf("WSAStartup failed with error: %d\n", result);
+        markHttpServerStopped();
         return 1;
     }
     g_serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (g_serverSocket == INVALID_SOCKET) {
         _plugin_logprintf("Failed to create socket, error: %d\n", WSAGetLastError());
         WSACleanup();
+        markHttpServerStopped();
         return 1;
     }
     sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     serverAddr.sin_port = htons((u_short)g_httpPort);
+    if (!resolveListenAddress(g_httpHost, serverAddr)) {
+        _plugin_logprintf("Invalid HTTP listen host: %s\n", g_httpHost.c_str());
+        closesocket(g_serverSocket);
+        WSACleanup();
+        markHttpServerStopped();
+        return 1;
+    }
     if (bind(g_serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
         _plugin_logprintf("Bind failed with error: %d\n", WSAGetLastError());
         closesocket(g_serverSocket);
         WSACleanup();
+        markHttpServerStopped();
         return 1;
     }
     if (listen(g_serverSocket, SOMAXCONN) == SOCKET_ERROR) {
         _plugin_logprintf("Listen failed with error: %d\n", WSAGetLastError());
         closesocket(g_serverSocket);
         WSACleanup();
+        markHttpServerStopped();
         return 1;
     }
     
-    _plugin_logprintf("HTTP server started at http://localhost:%d/\n", g_httpPort);
+    _plugin_logprintf("HTTP server started at http://%s:%d/\n", g_httpHost.c_str(), g_httpPort);
     u_long mode = 1;
     ioctlsocket(g_serverSocket, FIONBIO, &mode);
     while (g_httpServerRunning) {
@@ -258,7 +445,19 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
             parseHttpRequest(requestData, method, path, query, body);
             std::unordered_map<std::string, std::string> queryParams = parseQueryParams(query);
             try {
-                if (path == "/ExecCommand") {
+                if (path == "/Health" || path == "/health" || path == "/healthz") {
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"ok\":true,";
+                    ss << "\"service\":\"x64dbg_mcp_plugin\",";
+                    ss << "\"listenHost\":\"" << escapeJsonString(g_httpHost.c_str()) << "\",";
+                    ss << "\"port\":" << g_httpPort << ",";
+                    ss << "\"debugging\":" << (DbgIsDebugging() ? "true" : "false") << ",";
+                    ss << "\"running\":" << (DbgIsRunning() ? "true" : "false");
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/ExecCommand") {
                     std::string cmd = queryParams["cmd"];
                     if (cmd.empty() && !body.empty()) {
                         cmd = body;
@@ -610,28 +809,58 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                 }
                 
                 else if (path == "/Debug/Run") {
-                    Script::Debug::Run();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Debug run executed");
+                    sendHttpResponse(clientSocket, 409, "application/json",
+                        "{\"ok\":false,\"error\":\"Synchronous Debug/Run is disabled to avoid blocking the HTTP server; use /Debug/RunAsync or press F9 in x64dbg.\"}");
+                }
+                else if (path == "/Debug/RunAsync") {
+                    bool queued = queueDebugAction(DebugAction::Run);
+                    sendHttpResponse(clientSocket, queued ? 202 : 500, "application/json",
+                        queued ? "{\"queued\":true,\"action\":\"Run\"}" : "{\"queued\":false,\"error\":\"Debug action worker is not running\"}");
                 }
                 else if (path == "/Debug/Pause") {
-                    Script::Debug::Pause();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Debug pause executed");
+                    sendHttpResponse(clientSocket, 409, "application/json",
+                        "{\"ok\":false,\"error\":\"Synchronous Debug/Pause is disabled; use /Debug/PauseAsync.\"}");
+                }
+                else if (path == "/Debug/PauseAsync") {
+                    bool queued = queueDebugAction(DebugAction::Pause);
+                    sendHttpResponse(clientSocket, queued ? 202 : 500, "application/json",
+                        queued ? "{\"queued\":true,\"action\":\"Pause\"}" : "{\"queued\":false,\"error\":\"Debug action worker is not running\"}");
                 }
                 else if (path == "/Debug/Stop") {
-                    Script::Debug::Stop();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Debug stop executed");
+                    sendHttpResponse(clientSocket, 409, "application/json",
+                        "{\"ok\":false,\"error\":\"Synchronous Debug/Stop is disabled; use /Debug/StopAsync.\"}");
+                }
+                else if (path == "/Debug/StopAsync") {
+                    bool queued = queueDebugAction(DebugAction::Stop);
+                    sendHttpResponse(clientSocket, queued ? 202 : 500, "application/json",
+                        queued ? "{\"queued\":true,\"action\":\"Stop\"}" : "{\"queued\":false,\"error\":\"Debug action worker is not running\"}");
                 }
                 else if (path == "/Debug/StepIn") {
-                    Script::Debug::StepIn();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Step in executed");
+                    sendHttpResponse(clientSocket, 409, "application/json",
+                        "{\"ok\":false,\"error\":\"Synchronous Debug/StepIn is disabled; use /Debug/StepInAsync.\"}");
+                }
+                else if (path == "/Debug/StepInAsync") {
+                    bool queued = queueDebugAction(DebugAction::StepIn);
+                    sendHttpResponse(clientSocket, queued ? 202 : 500, "application/json",
+                        queued ? "{\"queued\":true,\"action\":\"StepIn\"}" : "{\"queued\":false,\"error\":\"Debug action worker is not running\"}");
                 }
                 else if (path == "/Debug/StepOver") {
-                    Script::Debug::StepOver();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Step over executed");
+                    sendHttpResponse(clientSocket, 409, "application/json",
+                        "{\"ok\":false,\"error\":\"Synchronous Debug/StepOver is disabled; use /Debug/StepOverAsync.\"}");
+                }
+                else if (path == "/Debug/StepOverAsync") {
+                    bool queued = queueDebugAction(DebugAction::StepOver);
+                    sendHttpResponse(clientSocket, queued ? 202 : 500, "application/json",
+                        queued ? "{\"queued\":true,\"action\":\"StepOver\"}" : "{\"queued\":false,\"error\":\"Debug action worker is not running\"}");
                 }
                 else if (path == "/Debug/StepOut") {
-                    Script::Debug::StepOut();
-                    sendHttpResponse(clientSocket, 200, "text/plain", "Step out executed");
+                    sendHttpResponse(clientSocket, 409, "application/json",
+                        "{\"ok\":false,\"error\":\"Synchronous Debug/StepOut is disabled; use /Debug/StepOutAsync.\"}");
+                }
+                else if (path == "/Debug/StepOutAsync") {
+                    bool queued = queueDebugAction(DebugAction::StepOut);
+                    sendHttpResponse(clientSocket, queued ? 202 : 500, "application/json",
+                        queued ? "{\"queued\":true,\"action\":\"StepOut\"}" : "{\"queued\":false,\"error\":\"Debug action worker is not running\"}");
                 }
                 else if (path == "/Debug/SetBreakpoint") {
                     std::string addrStr = queryParams["addr"];
@@ -855,25 +1084,8 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/Disasm/StepInWithDisasm") {
-                    // Step in first
-                    Script::Debug::StepIn();
-                    
-                    // Then get current instruction
-                    duint rip = Script::Register::Get(REG_IP);
-                    
-                    DISASM_INSTR instr;
-                    DbgDisasmAt(rip, &instr);
-                    
-                    // Create JSON response
-                    std::stringstream ss;
-                    ss << "{";
-                    ss << "\"step_result\":\"Step in executed\",";
-                    ss << "\"rip\":\"0x" << std::hex << rip << "\",";
-                    ss << "\"instruction\":\"" << instr.instruction << "\",";
-                    ss << "\"size\":" << std::dec << instr.instr_size;
-                    ss << "}";
-                    
-                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                    sendHttpResponse(clientSocket, 409, "application/json",
+                        "{\"ok\":false,\"error\":\"StepInWithDisasm used a synchronous step and is disabled; use /Debug/StepInAsync and then /Disasm/GetInstructionRange after the debugger stops.\"}");
                 }
                 else if (path == "/Flag/Get") {
                     std::string flagName = queryParams["flag"];
@@ -2086,20 +2298,30 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
     }
 
     WSACleanup();
+    markHttpServerStopped();
     return 0;
 }
 
 std::string readHttpRequest(SOCKET clientSocket) {
     std::string request;
     char buffer[MAX_REQUEST_SIZE];
-    int bytesReceived;
+    int timeoutMs = 3000;
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
     u_long mode = 0;
     ioctlsocket(clientSocket, FIONBIO, &mode);
-    bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-    
-    if (bytesReceived > 0) {
+
+    while (request.find("\r\n\r\n") == std::string::npos && request.length() < MAX_REQUEST_SIZE - 1) {
+        int remaining = MAX_REQUEST_SIZE - 1 - (int)request.length();
+        int chunkSize = remaining < (int)sizeof(buffer) - 1 ? remaining : (int)sizeof(buffer) - 1;
+        int bytesReceived = recv(clientSocket, buffer, chunkSize, 0);
+        if (bytesReceived <= 0) {
+            break;
+        }
         buffer[bytesReceived] = '\0';
-        request = buffer;
+        request.append(buffer, bytesReceived);
+        if (bytesReceived < chunkSize) {
+            break;
+        }
     }
     
     return request;
@@ -2144,7 +2366,10 @@ void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& co
     std::string statusText;
     switch (statusCode) {
         case 200: statusText = "OK"; break;
+        case 202: statusText = "Accepted"; break;
+        case 400: statusText = "Bad Request"; break;
         case 404: statusText = "Not Found"; break;
+        case 409: statusText = "Conflict"; break;
         case 500: statusText = "Internal Server Error"; break;
         default: statusText = "Unknown";
     }
@@ -2239,9 +2464,42 @@ bool cbSetHttpPort(int argc, char* argv[]) {
     return true;
 }
 
+bool cbSetHttpHost(int argc, char* argv[]) {
+    if (argc < 2) {
+        _plugin_logputs("Usage: httphost [127.0.0.1|0.0.0.0|IPv4]");
+        return false;
+    }
+
+    std::string host = argv[1];
+    sockaddr_in testAddr;
+    memset(&testAddr, 0, sizeof(testAddr));
+    if (!resolveListenAddress(host, testAddr)) {
+        _plugin_logputs("Invalid host. Use 127.0.0.1, 0.0.0.0, *, any, or a numeric IPv4 address.");
+        return false;
+    }
+
+    g_httpHost = host;
+
+    if (g_httpServerRunning) {
+        _plugin_logputs("Restarting HTTP server with new host...");
+        stopHttpServer();
+        if (startHttpServer()) {
+            _plugin_logprintf("HTTP server restarted on %s:%d\n", g_httpHost.c_str(), g_httpPort);
+        } else {
+            _plugin_logputs("Failed to restart HTTP server");
+        }
+    } else {
+        _plugin_logprintf("HTTP host set to %s\n", g_httpHost.c_str());
+    }
+
+    return true;
+}
+
 void registerCommands() {
     _plugin_registercommand(g_pluginHandle, "httpserver", cbEnableHttpServer, 
                            "Toggle HTTP server on/off");
     _plugin_registercommand(g_pluginHandle, "httpport", cbSetHttpPort, 
                            "Set HTTP server port");
+    _plugin_registercommand(g_pluginHandle, "httphost", cbSetHttpHost,
+                           "Set HTTP server listen host");
 }
