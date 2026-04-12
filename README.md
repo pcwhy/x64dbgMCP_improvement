@@ -261,6 +261,43 @@ Observed behavior:
 - `/Debug/RunAsync` returns immediately with `{"queued":true,"action":"Run"}`.
 - The debugger can still be queried remotely after async run requests.
 
+## Python Client Helper
+
+This repository also includes a Python helper, `x64dbg.py`, for driving the x64dbgMCP HTTP API from another process or another machine.
+
+The local helper has been adjusted to work better with the improved plugin:
+
+- Default debugger URL can be overridden with the `X64DBG_URL` environment variable.
+- The debugger URL can also be supplied as the first positional argument when it starts with `http`.
+- `safe_get()` uses a longer timeout for debugger operations that may take a moment.
+- `safe_post()` keeps a shorter timeout so stalled POST requests fail quickly.
+- `IsDebugging()` and `IsDebugActive()` parse JSON responses from the improved plugin.
+- Added `DebugRunAsync()` as a wrapper for `/Debug/RunAsync`.
+- Added `DebugPauseAsync()` as a wrapper for `/Debug/PauseAsync`.
+- Added internal tool-registry helpers so MCP tool functions can be listed and invoked by name.
+- Added an optional Claude/Anthropic CLI path that can expose the debugger tools to an LLM-driven workflow.
+
+Typical local usage:
+
+```bash
+x64dbgvenv/bin/python x64dbg.py
+```
+
+With an explicit debugger URL:
+
+```bash
+X64DBG_URL=http://192.168.1.212:8888/ x64dbgvenv/bin/python x64dbg.py
+```
+
+For GUI targets or any target expected to keep running, prefer the async wrappers:
+
+```text
+DebugRunAsync()
+DebugPauseAsync()
+```
+
+Avoid synchronous `/Debug/Run` for long-running debuggees because it can block the HTTP request path in older plugin builds.
+
 ## Troubleshooting
 
 If `httphost` is not recognized, x32dbg is still loading the old plugin. Make sure the rebuilt `.dp32` file was copied into the x32dbg plugin directory and that x32dbg was restarted.
