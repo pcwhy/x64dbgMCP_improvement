@@ -1,4 +1,4 @@
-# Improved MCP Plugin and Client-Side Script for x64dbg and x32dbg
+# Improved MCP Server Plugin and Client-Side Helper Script for x64dbg and x32dbg
 
 This repository contains a patched and extended build of the x64dbg MCP/HTTP plugin used for remote-assisted x32dbg/x64dbg debugging.
 
