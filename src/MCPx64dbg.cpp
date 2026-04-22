@@ -109,6 +109,10 @@ std::string escapeJsonString(const char* str);
 bool resolveListenAddress(const std::string& host, sockaddr_in& serverAddr);
 std::string debugActionName(DebugAction action);
 std::string breakpointTypeName(BPXTYPE type);
+bool tryParseHexAddress(const std::string& value, duint& addr);
+bool getBreakpointByAddress(duint addr, BRIDGEBP& outBp);
+std::string formatBreakpointAddress(duint addr);
+bool applyBreakpointSilentFlag(duint addr, bool silent, std::string& attemptsSummary, bool& finalSilent);
 void appendEventLog(const std::string& kind, const std::string& text);
 std::string trimForLog(const std::string& text);
 void clearEventLog();
@@ -225,6 +229,86 @@ std::string breakpointTypeName(BPXTYPE type) {
         case bp_exception: return "exception";
         default: return "unknown";
     }
+}
+
+bool tryParseHexAddress(const std::string& value, duint& addr) {
+    try {
+        if (value.size() > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+            addr = std::stoull(value.substr(2), nullptr, 16);
+        } else {
+            addr = std::stoull(value, nullptr, 16);
+        }
+        return true;
+    } catch (const std::exception&) {
+        addr = 0;
+        return false;
+    }
+}
+
+bool getBreakpointByAddress(duint addr, BRIDGEBP& outBp) {
+    BPMAP bpmap;
+    memset(&bpmap, 0, sizeof(bpmap));
+    int count = DbgGetBpList(bp_normal, &bpmap);
+    bool found = false;
+
+    if (count > 0 && bpmap.bp != nullptr) {
+        for (int i = 0; i < bpmap.count; i++) {
+            if (bpmap.bp[i].addr == addr) {
+                outBp = bpmap.bp[i];
+                found = true;
+                break;
+            }
+        }
+        BridgeFree(bpmap.bp);
+    }
+    return found;
+}
+
+std::string formatBreakpointAddress(duint addr) {
+    std::ostringstream ss;
+    ss << "0x" << std::hex << std::uppercase << DUINT_CAST_PRINTF(addr);
+    return ss.str();
+}
+
+bool applyBreakpointSilentFlag(duint addr, bool silent, std::string& attemptsSummary, bool& finalSilent) {
+    std::vector<std::string> commands;
+    const std::string addrText = formatBreakpointAddress(addr);
+    if (silent) {
+        commands.push_back("SetBreakpointSilent " + addrText + ",1");
+        commands.push_back("bpsilent " + addrText + ",1");
+    } else {
+        commands.push_back("SetBreakpointSilent " + addrText + ",0");
+        commands.push_back("SetBreakpointSilent " + addrText);
+        commands.push_back("bpsilent " + addrText + ",0");
+    }
+
+    std::ostringstream attempts;
+    bool applied = false;
+    finalSilent = false;
+
+    for (size_t i = 0; i < commands.size(); i++) {
+        const bool execOk = DbgCmdExecDirect(commands[i].c_str());
+        BRIDGEBP bp;
+        bool found = getBreakpointByAddress(addr, bp);
+        bool currentSilent = found ? bp.silent : false;
+        if (i > 0) {
+            attempts << " | ";
+        }
+        attempts << commands[i] << " -> exec=" << (execOk ? "1" : "0");
+        if (found) {
+            attempts << ",silent=" << (currentSilent ? "1" : "0");
+            finalSilent = currentSilent;
+        } else {
+            attempts << ",missing=1";
+        }
+        if (execOk && found && currentSilent == silent) {
+            applied = true;
+            break;
+        }
+    }
+
+    attemptsSummary = attempts.str();
+    return applied;
 }
 
 std::string trimForLog(const std::string& text) {
@@ -1145,6 +1229,47 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     bool success = Script::Debug::DeleteBreakpoint(addr);
                     sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain", 
                         success ? "Breakpoint deleted successfully" : "Failed to delete breakpoint");
+                }
+                else if (path == "/Breakpoint/SetSilent") {
+                    std::string addrStr = queryParams["addr"];
+                    std::string silentStr = queryParams["silent"];
+                    if (addrStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'addr' parameter\"}");
+                        continue;
+                    }
+
+                    duint addr = 0;
+                    if (!tryParseHexAddress(addrStr, addr)) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Invalid address format\"}");
+                        continue;
+                    }
+
+                    std::string silentLower = silentStr;
+                    std::transform(silentLower.begin(), silentLower.end(), silentLower.begin(), ::tolower);
+                    bool requestedSilent = !(silentLower == "0" || silentLower == "false" || silentLower == "off" || silentLower == "no");
+
+                    BRIDGEBP bp;
+                    if (!getBreakpointByAddress(addr, bp)) {
+                        sendHttpResponse(clientSocket, 404, "application/json",
+                            "{\"error\":\"Breakpoint not found\"}");
+                        continue;
+                    }
+
+                    std::string attemptsSummary;
+                    bool finalSilent = bp.silent;
+                    bool applied = applyBreakpointSilentFlag(addr, requestedSilent, attemptsSummary, finalSilent);
+
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"success\":" << (applied ? "true" : "false") << ",";
+                    ss << "\"addr\":\"" << formatBreakpointAddress(addr) << "\",";
+                    ss << "\"requestedSilent\":" << (requestedSilent ? "true" : "false") << ",";
+                    ss << "\"finalSilent\":" << (finalSilent ? "true" : "false") << ",";
+                    ss << "\"attempts\":\"" << escapeJsonString(attemptsSummary.c_str()) << "\"";
+                    ss << "}";
+                    sendHttpResponse(clientSocket, applied ? 200 : 409, "application/json", ss.str());
                 }
                 
                 else if (path == "/Assembler/Assemble") {

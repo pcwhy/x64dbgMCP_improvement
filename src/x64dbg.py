@@ -485,6 +485,38 @@ def DebugDeleteBreakpoint(addr: str) -> str:
 
 
 @mcp.tool()
+def BreakpointSetSilent(addr: str, silent: bool = True) -> dict:
+    """
+    Set the silent flag for a software breakpoint using a plugin-side verified path.
+
+    This endpoint is preferred over issuing raw `SetBreakpointSilent` commands
+    through `ExecCommand`, because the plugin retries the known x64dbg variants
+    and verifies the final flag state through `Breakpoint/List`.
+
+    Parameters:
+        addr: Address of an existing software breakpoint (hex format)
+        silent: True to enable the silent flag, False to try to disable it
+
+    Returns:
+        Dictionary with:
+        - success: Whether the requested final silent state was verified
+        - addr: Breakpoint address
+        - requestedSilent: Requested silent state
+        - finalSilent: Verified silent state after the attempts
+        - attempts: Summary of the x64dbg commands tried internally
+    """
+    result = safe_get("Breakpoint/SetSilent", {"addr": addr, "silent": str(silent).lower()})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
 def AssemblerAssemble(addr: str, instruction: str) -> dict:
     """
     Assemble instruction at address using Script API
