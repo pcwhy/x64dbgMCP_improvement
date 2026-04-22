@@ -2,6 +2,7 @@ import sys
 import os
 import inspect
 import json
+import time
 from typing import Any, Callable, Dict, List, Optional
 import requests
 
@@ -26,6 +27,46 @@ def set_x64dbg_server_url(url: str) -> None:
 
 mcp = FastMCP("x64dbg-mcp")
 
+def _endpoint_url(endpoint: str) -> str:
+    return f"{x64dbg_server_url.rstrip('/')}/{endpoint.lstrip('/')}"
+
+def _looks_like_json_payload(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("{") or stripped.startswith("[")
+
+def _decode_response(response: requests.Response) -> Any:
+    response.encoding = "utf-8"
+    content_type = response.headers.get("Content-Type", "").lower()
+    text = response.text.strip()
+
+    # Most x64dbg endpoints intentionally return plain text. Avoid interpreting
+    # values like `Infinity` or `true` as JSON unless the server declared JSON
+    # or the payload is visibly JSON-shaped.
+    if "application/json" in content_type or _looks_like_json_payload(text):
+        try:
+            return response.json()
+        except ValueError:
+            pass
+    return text
+
+def _request(method: str, endpoint: str, **kwargs):
+    url = _endpoint_url(endpoint)
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = requests.request(method, url, timeout=kwargs.pop("timeout", 15), **kwargs)
+            if response.ok:
+                return _decode_response(response)
+            return f"Error {response.status_code}: {response.text.strip()}"
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_error = exc
+            if attempt == 2:
+                break
+            time.sleep(0.2 * (attempt + 1))
+        except Exception as exc:
+            return f"Request failed: {str(exc)}"
+    return f"Request failed: {str(last_error)}"
+
 def safe_get(endpoint: str, params: dict = None):
     """
     Perform a GET request with optional query parameters.
@@ -33,47 +74,15 @@ def safe_get(endpoint: str, params: dict = None):
     """
     if params is None:
         params = {}
-
-    url = f"{x64dbg_server_url}{endpoint}"
-
-    try:
-        response = requests.get(url, params=params, timeout=15)
-        response.encoding = 'utf-8'
-        if response.ok:
-            # Try to parse as JSON first
-            try:
-                return response.json()
-            except ValueError:
-                return response.text.strip()
-        else:
-            return f"Error {response.status_code}: {response.text.strip()}"
-    except Exception as e:
-        return f"Request failed: {str(e)}"
+    return _request("GET", endpoint, params=params, timeout=15)
 
 def safe_post(endpoint: str, data: dict | str):
     """
     Perform a POST request with data.
     Returns parsed JSON if possible, otherwise text content
     """
-    try:
-        url = f"{x64dbg_server_url}{endpoint}"
-        if isinstance(data, dict):
-            response = requests.post(url, data=data, timeout=5)
-        else:
-            response = requests.post(url, data=data.encode("utf-8"), timeout=5)
-        
-        response.encoding = 'utf-8'
-        
-        if response.ok:
-            # Try to parse as JSON first
-            try:
-                return response.json()
-            except ValueError:
-                return response.text.strip()
-        else:
-            return f"Error {response.status_code}: {response.text.strip()}"
-    except Exception as e:
-        return f"Request failed: {str(e)}"
+    payload = data if isinstance(data, dict) else data.encode("utf-8")
+    return _request("POST", endpoint, data=payload, timeout=5)
 
 
 def _get_mcp_tools_registry() -> Dict[str, Callable[..., Any]]:
@@ -191,6 +200,58 @@ def ExecCommand(cmd: str, offset: int = 0, limit: int = 100) -> dict:
                   (typically [address, disassembly] or [address, disassembly, string_address, string])
     """
     return safe_get("ExecCommand", {"cmd": cmd, "offset": offset, "limit": limit})
+
+
+@mcp.tool()
+def GetRecentLog(limit: int = 100, since: int = 0, clear: bool = False) -> dict:
+    """
+    Read recent plugin-captured debugger events.
+
+    This endpoint reads the plugin-side event buffer, which is intended to be
+    more reliable than scraping the x64dbg GUI log window. Entries currently
+    include plugin-captured breakpoint hits and debug-string events.
+
+    Parameters:
+        limit: Maximum number of recent entries to return (default: 100, max: 2000)
+        since: Only return entries with seq greater than this value (default: 0)
+        clear: Clear the buffer after reading (default: False)
+
+    Returns:
+        Dictionary with:
+        - count: Number of returned entries
+        - totalBuffered: Current number of entries still buffered
+        - entries: List of event objects with seq, tickMs, kind, and text
+    """
+    result = safe_get("Log/Recent", {"limit": limit, "since": since, "clear": str(clear).lower()})
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def ClearLog() -> dict:
+    """
+    Clear the plugin-captured event buffer.
+
+    Returns:
+        Dictionary with:
+        - success: Whether the clear request succeeded
+        - cleared: Number of entries removed
+    """
+    result = safe_get("Log/Clear")
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
 
 
 @mcp.tool()
@@ -330,6 +391,16 @@ def DebugRun() -> str:
     return safe_get("Debug/Run")
 
 @mcp.tool()
+def DebugRunAsync() -> str:
+    """
+    Queue a non-blocking resume request for the debugged process.
+
+    This is safer than DebugRun for GUI programs because the HTTP handler
+    returns immediately instead of waiting while the debuggee runs.
+    """
+    return safe_get("Debug/RunAsync")
+
+@mcp.tool()
 def DebugPause() -> str:
     """
     Pause execution of the debugged process using Script API
@@ -338,6 +409,13 @@ def DebugPause() -> str:
         Status message
     """
     return safe_get("Debug/Pause")
+
+@mcp.tool()
+def DebugPauseAsync() -> str:
+    """
+    Queue a non-blocking pause request for the debugged process.
+    """
+    return safe_get("Debug/PauseAsync")
 
 @mcp.tool()
 def DebugStop() -> str:

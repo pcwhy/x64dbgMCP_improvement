@@ -30,6 +30,7 @@
 #include <mutex>
 #include <algorithm>
 #include <cctype>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -62,6 +63,18 @@ int g_httpPort = DEFAULT_PORT;
 std::string g_httpHost = "127.0.0.1";
 std::mutex g_httpMutex;
 SOCKET g_serverSocket = INVALID_SOCKET;
+std::mutex g_eventLogMutex;
+
+struct EventLogEntry {
+    unsigned long long seq;
+    unsigned long long tickMs;
+    std::string kind;
+    std::string text;
+};
+
+std::deque<EventLogEntry> g_eventLog;
+unsigned long long g_eventLogSeq = 0;
+const size_t MAX_EVENT_LOG_ENTRIES = 4096;
 
 enum class DebugAction {
     Run,
@@ -83,6 +96,8 @@ void stopHttpServer();
 bool startDebugActionWorker();
 void stopDebugActionWorker();
 bool queueDebugAction(DebugAction action);
+bool registerPluginCallbacks();
+void unregisterPluginCallbacks();
 DWORD WINAPI DebugActionThread(LPVOID lpParam);
 DWORD WINAPI HttpServerThread(LPVOID lpParam);
 std::string readHttpRequest(SOCKET clientSocket);
@@ -93,6 +108,14 @@ std::string urlDecode(const std::string& str);
 std::string escapeJsonString(const char* str);
 bool resolveListenAddress(const std::string& host, sockaddr_in& serverAddr);
 std::string debugActionName(DebugAction action);
+std::string breakpointTypeName(BPXTYPE type);
+void appendEventLog(const std::string& kind, const std::string& text);
+std::string trimForLog(const std::string& text);
+void clearEventLog();
+size_t eventLogSize();
+std::string readOutputDebugString(const OUTPUT_DEBUG_STRING_INFO* info);
+void cbBreakpointEvent(CBTYPE bType, void* callbackInfo);
+void cbOutputDebugStringEvent(CBTYPE bType, void* callbackInfo);
 
 bool cbEnableHttpServer(int argc, char* argv[]);
 bool cbSetHttpPort(int argc, char* argv[]);
@@ -107,6 +130,7 @@ bool pluginInit(PLUG_INITSTRUCT* initStruct) {
     
     _plugin_logputs("x64dbg HTTP Server plugin loading...");
     registerCommands();
+    registerPluginCallbacks();
     if (!startDebugActionWorker()) {
         _plugin_logputs("Failed to start debug action worker!");
     }
@@ -122,6 +146,7 @@ bool pluginInit(PLUG_INITSTRUCT* initStruct) {
 
 void pluginStop() {
     _plugin_logputs("Stopping x64dbg HTTP Server...");
+    unregisterPluginCallbacks();
     stopHttpServer();
     stopDebugActionWorker();
     _plugin_logputs("x64dbg HTTP Server stopped.");
@@ -189,6 +214,159 @@ std::string debugActionName(DebugAction action) {
         case DebugAction::StepOut: return "StepOut";
     }
     return "Unknown";
+}
+
+std::string breakpointTypeName(BPXTYPE type) {
+    switch (type) {
+        case bp_normal: return "normal";
+        case bp_hardware: return "hardware";
+        case bp_memory: return "memory";
+        case bp_dll: return "dll";
+        case bp_exception: return "exception";
+        default: return "unknown";
+    }
+}
+
+std::string trimForLog(const std::string& text) {
+    size_t start = 0;
+    while (start < text.size() && (text[start] == '\r' || text[start] == '\n')) {
+        start++;
+    }
+    size_t end = text.size();
+    while (end > start && (text[end - 1] == '\r' || text[end - 1] == '\n')) {
+        end--;
+    }
+    std::string trimmed = text.substr(start, end - start);
+    if (trimmed.size() > 1024) {
+        trimmed.resize(1024);
+        trimmed += "...";
+    }
+    return trimmed;
+}
+
+void appendEventLog(const std::string& kind, const std::string& text) {
+    std::lock_guard<std::mutex> lock(g_eventLogMutex);
+    EventLogEntry entry;
+    entry.seq = ++g_eventLogSeq;
+    entry.tickMs = GetTickCount64();
+    entry.kind = kind;
+    entry.text = trimForLog(text);
+    g_eventLog.push_back(entry);
+    while (g_eventLog.size() > MAX_EVENT_LOG_ENTRIES) {
+        g_eventLog.pop_front();
+    }
+}
+
+void clearEventLog() {
+    std::lock_guard<std::mutex> lock(g_eventLogMutex);
+    g_eventLog.clear();
+}
+
+size_t eventLogSize() {
+    std::lock_guard<std::mutex> lock(g_eventLogMutex);
+    return g_eventLog.size();
+}
+
+std::string readOutputDebugString(const OUTPUT_DEBUG_STRING_INFO* info) {
+    if (!info || !info->lpDebugStringData || info->nDebugStringLength == 0) {
+        return "";
+    }
+
+    duint addr = (duint)info->lpDebugStringData;
+    duint sizeRead = 0;
+    size_t charCount = static_cast<size_t>(info->nDebugStringLength);
+    if (charCount > 4096) {
+        charCount = 4096;
+    }
+
+    if (info->fUnicode) {
+        std::vector<wchar_t> buffer(charCount + 1, L'\0');
+        if (!Script::Memory::Read(addr, buffer.data(), charCount * sizeof(wchar_t), &sizeRead) || sizeRead == 0) {
+            return "";
+        }
+        buffer[sizeRead / sizeof(wchar_t)] = L'\0';
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, buffer.data(), -1, NULL, 0, NULL, NULL);
+        if (utf8Len <= 1) {
+            return "";
+        }
+        std::string utf8(static_cast<size_t>(utf8Len), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, buffer.data(), -1, &utf8[0], utf8Len, NULL, NULL);
+        if (!utf8.empty() && utf8.back() == '\0') {
+            utf8.pop_back();
+        }
+        return utf8;
+    }
+
+    std::vector<char> buffer(charCount + 1, '\0');
+    if (!Script::Memory::Read(addr, buffer.data(), charCount, &sizeRead) || sizeRead == 0) {
+        return "";
+    }
+    buffer[sizeRead] = '\0';
+    return std::string(buffer.data());
+}
+
+void cbBreakpointEvent(CBTYPE bType, void* callbackInfo) {
+    auto* info = static_cast<PLUG_CB_BREAKPOINT*>(callbackInfo);
+    if (!info || !info->breakpoint) {
+        appendEventLog("breakpoint", "callback received without breakpoint metadata");
+        return;
+    }
+
+    const BRIDGEBP& bp = *info->breakpoint;
+    std::ostringstream ss;
+    ss << "addr=0x" << std::hex << bp.addr
+       << " type=" << breakpointTypeName(bp.type)
+       << " enabled=" << (bp.enabled ? "1" : "0")
+       << " singleshoot=" << (bp.singleshoot ? "1" : "0")
+       << " active=" << (bp.active ? "1" : "0")
+       << " silent=" << (bp.silent ? "1" : "0")
+       << " fastResume=" << (bp.fastResume ? "1" : "0")
+       << " hitCount=" << std::dec << bp.hitCount;
+    if (bp.mod[0] != '\0') {
+        ss << " module=" << bp.mod;
+    }
+    if (bp.name[0] != '\0') {
+        ss << " name=" << bp.name;
+    }
+    if (bp.breakCondition[0] != '\0') {
+        ss << " breakCondition=" << bp.breakCondition;
+    }
+    if (bp.logText[0] != '\0') {
+        ss << " logText=" << bp.logText;
+    }
+    if (bp.commandText[0] != '\0') {
+        ss << " commandText=" << bp.commandText;
+    }
+    appendEventLog("breakpoint", ss.str());
+}
+
+void cbOutputDebugStringEvent(CBTYPE bType, void* callbackInfo) {
+    auto* info = static_cast<PLUG_CB_OUTPUTDEBUGSTRING*>(callbackInfo);
+    if (!info || !info->DebugString) {
+        appendEventLog("output_debug_string", "callback received without debug-string metadata");
+        return;
+    }
+
+    std::string text = readOutputDebugString(info->DebugString);
+    if (text.empty()) {
+        appendEventLog("output_debug_string", "received empty debug string");
+        return;
+    }
+    appendEventLog("output_debug_string", text);
+}
+
+bool registerPluginCallbacks() {
+    bool ok = true;
+    _plugin_registercallback(g_pluginHandle, CB_BREAKPOINT, cbBreakpointEvent);
+    _plugin_registercallback(g_pluginHandle, CB_OUTPUTDEBUGSTRING, cbOutputDebugStringEvent);
+    appendEventLog("plugin", "registered CB_BREAKPOINT and CB_OUTPUTDEBUGSTRING callbacks");
+    return ok;
+}
+
+void unregisterPluginCallbacks() {
+    _plugin_unregistercallback(g_pluginHandle, CB_BREAKPOINT);
+    _plugin_unregistercallback(g_pluginHandle, CB_OUTPUTDEBUGSTRING);
+    appendEventLog("plugin", "unregistered CB_BREAKPOINT and CB_OUTPUTDEBUGSTRING callbacks");
 }
 
 bool startDebugActionWorker() {
@@ -454,6 +632,66 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     ss << "\"port\":" << g_httpPort << ",";
                     ss << "\"debugging\":" << (DbgIsDebugging() ? "true" : "false") << ",";
                     ss << "\"running\":" << (DbgIsRunning() ? "true" : "false");
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Log/Recent" || path == "/log/recent") {
+                    int limit = 100;
+                    unsigned long long since = 0;
+                    bool clearAfter = false;
+
+                    if (!queryParams["limit"].empty()) {
+                        try { limit = std::stoi(queryParams["limit"]); } catch (...) {}
+                        if (limit < 1) limit = 1;
+                        if (limit > 2000) limit = 2000;
+                    }
+                    if (!queryParams["since"].empty()) {
+                        try { since = std::stoull(queryParams["since"]); } catch (...) {}
+                    }
+                    std::string clearStr = queryParams["clear"];
+                    std::transform(clearStr.begin(), clearStr.end(), clearStr.begin(), ::tolower);
+                    clearAfter = (clearStr == "1" || clearStr == "true" || clearStr == "yes");
+
+                    std::vector<EventLogEntry> entries;
+                    {
+                        std::lock_guard<std::mutex> lock(g_eventLogMutex);
+                        for (const auto& entry : g_eventLog) {
+                            if (entry.seq > since) {
+                                entries.push_back(entry);
+                            }
+                        }
+                        if (entries.size() > static_cast<size_t>(limit)) {
+                            entries.erase(entries.begin(), entries.end() - limit);
+                        }
+                        if (clearAfter) {
+                            g_eventLog.clear();
+                        }
+                    }
+
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"count\":" << entries.size() << ",";
+                    ss << "\"totalBuffered\":" << eventLogSize() << ",";
+                    ss << "\"entries\":[";
+                    for (size_t i = 0; i < entries.size(); i++) {
+                        if (i > 0) ss << ",";
+                        ss << "{"
+                           << "\"seq\":" << entries[i].seq << ","
+                           << "\"tickMs\":" << entries[i].tickMs << ","
+                           << "\"kind\":\"" << escapeJsonString(entries[i].kind.c_str()) << "\","
+                           << "\"text\":\"" << escapeJsonString(entries[i].text.c_str()) << "\""
+                           << "}";
+                    }
+                    ss << "]}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Log/Clear" || path == "/log/clear") {
+                    size_t cleared = eventLogSize();
+                    clearEventLog();
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"success\":true,";
+                    ss << "\"cleared\":" << cleared;
                     ss << "}";
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
