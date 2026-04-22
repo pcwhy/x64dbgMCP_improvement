@@ -75,6 +75,14 @@ struct EventLogEntry {
 std::deque<EventLogEntry> g_eventLog;
 unsigned long long g_eventLogSeq = 0;
 const size_t MAX_EVENT_LOG_ENTRIES = 4096;
+std::mutex g_breakpointContextMutex;
+
+struct BreakpointContextExpression {
+    std::string label;
+    std::string expression;
+};
+
+std::vector<BreakpointContextExpression> g_breakpointContextExpressions;
 
 enum class DebugAction {
     Run,
@@ -110,6 +118,11 @@ bool resolveListenAddress(const std::string& host, sockaddr_in& serverAddr);
 std::string debugActionName(DebugAction action);
 std::string breakpointTypeName(BPXTYPE type);
 bool tryParseHexAddress(const std::string& value, duint& addr);
+bool tryParseExpressionValue(const char* expression, duint& value);
+void appendExpressionIfAvailable(std::ostringstream& ss, const char* label, const char* expression);
+std::vector<BreakpointContextExpression> getBreakpointContextExpressions();
+void setBreakpointContextExpressions(const std::vector<BreakpointContextExpression>& expressions);
+std::vector<BreakpointContextExpression> parseBreakpointContextSpec(const std::string& spec);
 bool getBreakpointByAddress(duint addr, BRIDGEBP& outBp);
 std::string formatBreakpointAddress(duint addr);
 bool applyBreakpointSilentFlag(duint addr, bool silent, std::string& attemptsSummary, bool& finalSilent);
@@ -243,6 +256,60 @@ bool tryParseHexAddress(const std::string& value, duint& addr) {
         addr = 0;
         return false;
     }
+}
+
+bool tryParseExpressionValue(const char* expression, duint& value) {
+    if (!expression || !*expression) {
+        value = 0;
+        return false;
+    }
+    return Script::Misc::ParseExpression(expression, &value);
+}
+
+void appendExpressionIfAvailable(std::ostringstream& ss, const char* label, const char* expression) {
+    duint value = 0;
+    if (!tryParseExpressionValue(expression, value)) {
+        return;
+    }
+    ss << " " << label << "=" << formatBreakpointAddress(value);
+}
+
+std::vector<BreakpointContextExpression> getBreakpointContextExpressions() {
+    std::lock_guard<std::mutex> lock(g_breakpointContextMutex);
+    return g_breakpointContextExpressions;
+}
+
+void setBreakpointContextExpressions(const std::vector<BreakpointContextExpression>& expressions) {
+    std::lock_guard<std::mutex> lock(g_breakpointContextMutex);
+    g_breakpointContextExpressions = expressions;
+}
+
+std::vector<BreakpointContextExpression> parseBreakpointContextSpec(const std::string& spec) {
+    std::vector<BreakpointContextExpression> expressions;
+    std::string normalized = spec;
+    std::replace(normalized.begin(), normalized.end(), ';', '\n');
+
+    std::istringstream input(normalized);
+    std::string line;
+    while (std::getline(input, line)) {
+        trimParam(line);
+        if (line.empty()) {
+            continue;
+        }
+        size_t equalPos = line.find('=');
+        if (equalPos == std::string::npos) {
+            continue;
+        }
+        std::string label = line.substr(0, equalPos);
+        std::string expression = line.substr(equalPos + 1);
+        trimParam(label);
+        trimParam(expression);
+        if (label.empty() || expression.empty()) {
+            continue;
+        }
+        expressions.push_back({label, expression});
+    }
+    return expressions;
 }
 
 bool getBreakpointByAddress(duint addr, BRIDGEBP& outBp) {
@@ -420,6 +487,10 @@ void cbBreakpointEvent(CBTYPE bType, void* callbackInfo) {
     }
     if (bp.commandText[0] != '\0') {
         ss << " commandText=" << bp.commandText;
+    }
+    const auto expressions = getBreakpointContextExpressions();
+    for (const auto& item : expressions) {
+        appendExpressionIfAvailable(ss, item.label.c_str(), item.expression.c_str());
     }
     appendEventLog("breakpoint", ss.str());
 }
@@ -776,6 +847,56 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     ss << "{";
                     ss << "\"success\":true,";
                     ss << "\"cleared\":" << cleared;
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Log/BreakpointContext/List" || path == "/log/breakpointcontext/list") {
+                    const auto expressions = getBreakpointContextExpressions();
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"count\":" << expressions.size() << ",";
+                    ss << "\"items\":[";
+                    for (size_t i = 0; i < expressions.size(); i++) {
+                        if (i > 0) ss << ",";
+                        ss << "{"
+                           << "\"label\":\"" << escapeJsonString(expressions[i].label.c_str()) << "\","
+                           << "\"expression\":\"" << escapeJsonString(expressions[i].expression.c_str()) << "\""
+                           << "}";
+                    }
+                    ss << "]}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Log/BreakpointContext/Set" || path == "/log/breakpointcontext/set") {
+                    std::string spec = queryParams["items"];
+                    if (spec.empty() && !body.empty()) {
+                        spec = body;
+                    }
+                    spec = urlDecode(spec);
+                    const auto expressions = parseBreakpointContextSpec(spec);
+                    setBreakpointContextExpressions(expressions);
+
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"success\":true,";
+                    ss << "\"count\":" << expressions.size() << ",";
+                    ss << "\"items\":[";
+                    for (size_t i = 0; i < expressions.size(); i++) {
+                        if (i > 0) ss << ",";
+                        ss << "{"
+                           << "\"label\":\"" << escapeJsonString(expressions[i].label.c_str()) << "\","
+                           << "\"expression\":\"" << escapeJsonString(expressions[i].expression.c_str()) << "\""
+                           << "}";
+                    }
+                    ss << "]}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Log/BreakpointContext/Clear" || path == "/log/breakpointcontext/clear") {
+                    const auto oldExpressions = getBreakpointContextExpressions();
+                    setBreakpointContextExpressions({});
+                    std::stringstream ss;
+                    ss << "{";
+                    ss << "\"success\":true,";
+                    ss << "\"cleared\":" << oldExpressions.size();
                     ss << "}";
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }

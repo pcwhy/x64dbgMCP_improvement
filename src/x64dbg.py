@@ -255,6 +255,75 @@ def ClearLog() -> dict:
 
 
 @mcp.tool()
+def GetBreakpointContextExpressions() -> dict:
+    """
+    List the extra expressions currently appended to plugin breakpoint events.
+
+    Returns:
+        Dictionary with:
+        - count: Number of configured expressions
+        - items: List of {label, expression}
+    """
+    result = safe_get("Log/BreakpointContext/List")
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def SetBreakpointContextExpressions(items: str) -> dict:
+    """
+    Configure extra expressions to append to future breakpoint events.
+
+    Parameters:
+        items: Newline- or semicolon-separated `label=expression` pairs.
+               Example:
+               `writerTick=[ebp-0x0c];var24=[ebp-0x24];var2c=[ebp-0x2c]`
+
+    Returns:
+        Dictionary with:
+        - success: Whether the update succeeded
+        - count: Number of configured expressions
+        - items: List of {label, expression}
+    """
+    result = safe_get("Log/BreakpointContext/Set", {"items": items})
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def ClearBreakpointContextExpressions() -> dict:
+    """
+    Clear the extra expressions appended to future breakpoint events.
+
+    Returns:
+        Dictionary with:
+        - success: Whether the clear request succeeded
+        - cleared: Number of expressions removed
+    """
+    result = safe_get("Log/BreakpointContext/Clear")
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
 def IsDebugActive() -> bool:
     """
     Check if debugger is active (running)
