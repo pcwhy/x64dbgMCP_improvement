@@ -1,4 +1,4 @@
-# Improved MCP Server Plugin and Client-Side Helper Script for x64dbg and x32dbg
+# x64dbgMCP Improved
 
 This repository contains a patched and extended build of the x64dbg MCP/HTTP plugin used for remote-assisted x32dbg/x64dbg debugging.
 
@@ -33,6 +33,7 @@ This fork addresses those two issues while preserving the original command style
   - `/Debug/StepOverAsync`
   - `/Debug/StepOutAsync`
 - Added a debug action worker thread so async run/step requests return immediately.
+- Added a plugin-side event buffer plus HTTP log endpoints so remote clients can read recent breakpoint/debug-string events without scraping the x64dbg GUI log window.
 - Added a socket receive timeout to avoid stalled client connections blocking the HTTP thread.
 - Disabled the old synchronous `/Disasm/StepInWithDisasm` endpoint because it performed a direct step inside the HTTP request handler.
 - Fixed HTTP server start/stop state handling to avoid a potential self-lock/restart issue.
@@ -202,6 +203,62 @@ To toggle the HTTP server:
 httpserver
 ```
 
+## Reading Recent Events
+
+The plugin now keeps a small in-memory event buffer that remote clients can read directly. This is intended for cases where x64dbg GUI breakpoint logging is unreliable or hard to scrape remotely.
+
+Current event kinds:
+
+- `breakpoint`: emitted from the official `CB_BREAKPOINT` plugin callback and includes breakpoint metadata such as address, hit count, conditions, and configured log/command text.
+- `output_debug_string`: emitted from `CB_OUTPUTDEBUGSTRING` when the debuggee calls `OutputDebugString`.
+
+Read the newest buffered entries:
+
+```text
+/Log/Recent?limit=100
+```
+
+Read entries newer than a prior sequence id:
+
+```text
+/Log/Recent?since=250&limit=50
+```
+
+Read and clear in one request:
+
+```text
+/Log/Recent?limit=100&clear=true
+```
+
+Clear the buffer explicitly:
+
+```text
+/Log/Clear
+```
+
+Example response:
+
+```json
+{
+  "count": 2,
+  "totalBuffered": 2,
+  "entries": [
+    {
+      "seq": 41,
+      "tickMs": 381245,
+      "kind": "breakpoint",
+      "text": "addr=0x4c223b type=normal hitCount=3531 module=musicbox15 breakCondition=[ebp-0x0c]==0x4D10&&eax==0x42"
+    },
+    {
+      "seq": 42,
+      "tickMs": 381910,
+      "kind": "output_debug_string",
+      "text": "WT_19728_row72 tick=4D10 eax=42 eip=004C223B"
+    }
+  ]
+}
+```
+
 ## Debug Run Behavior
 
 The synchronous debug control endpoints are intentionally disabled:
@@ -245,6 +302,71 @@ Expected response:
 
 The request returns immediately. The debugger action is executed by a background worker thread.
 
+## Useful Inspection Endpoints
+
+Beyond the async debug-control changes, this fork already exposes several endpoints that are useful for live reverse-engineering and stack/frame inspection workflows.
+
+### Expression Evaluation
+
+`/Misc/ParseExpression` forwards to x64dbg's expression parser and returns a numeric `duint` result.
+
+This is often more robust than manually converting stack-slot indices because x64dbg evaluates the expression in the current paused CPU context.
+
+Examples:
+
+```text
+/Misc/ParseExpression?expression=cip
+/Misc/ParseExpression?expression=ebp
+/Misc/ParseExpression?expression=[ebp-0x2c]
+/Misc/ParseExpression?expression=[esp+4]
+```
+
+When `format=json` is supplied, the response shape is:
+
+```json
+{
+  "ok": true,
+  "value": "0x12345678"
+}
+```
+
+This endpoint is especially handy for reading frame-local variables such as `[ebp-0x2c]` without first translating them into `Stack/Peek` offsets.
+
+### Register Snapshot
+
+`/RegisterDump` returns a full register snapshot in one call. It wraps `DbgGetRegDumpEx(...)` and includes:
+
+- General-purpose registers
+- `cip` / instruction pointer
+- `eflags` plus decoded flag bits
+- Segment registers
+- Debug registers
+- Last error / last status fields
+
+This is preferable to many individual `/Register/Get` calls when the debugger is paused and a consistent register view matters.
+
+### Call Stack Snapshot
+
+`/GetCallStack` returns the current call stack using `GetCallStackEx(...)`, including:
+
+- The current address for each frame
+- Caller/callee addresses
+- x64dbg-generated comments or symbol names when available
+
+This is useful when a breakpoint can be hit from more than one path and the current frame needs to be disambiguated before reading locals.
+
+### Stack Helpers
+
+The plugin also exposes:
+
+```text
+/Stack/Pop
+/Stack/Push
+/Stack/Peek
+```
+
+`/Stack/Peek` is a thin wrapper over `Script::Stack::Peek(offset)`. It is convenient for top-of-stack inspection, but for frame-local reads such as `[ebp-0x2c]` or `[rbp-0x30]`, `/Misc/ParseExpression` is usually the safer choice.
+
 ## Tested Workflow
 
 The improved plugin has been tested in this workflow:
@@ -277,6 +399,25 @@ The local helper has been adjusted to work better with the improved plugin:
 - Added internal tool-registry helpers so MCP tool functions can be listed and invoked by name.
 - Added an optional Claude/Anthropic CLI path that can expose the debugger tools to an LLM-driven workflow.
 
+Operational notes that mattered in practice:
+
+- Many endpoints intentionally return plain text rather than JSON.
+  - Examples: `MemoryRead`, `RegisterGet`, `StackPeek`, `MiscParseExpression`
+  - If a one-off helper blindly `json.loads()` every `200 OK` body, it will mis-handle these endpoints.
+- The CLI wrapper uses positional arguments, not `key=value` pairs.
+  - Correct:
+    - `x64dbgvenv/bin/python x64dbg.py RegisterGet --x64dbg-url http://192.168.1.212:8888/ eax`
+    - `x64dbgvenv/bin/python x64dbg.py DebugSetBreakpoint --x64dbg-url http://192.168.1.212:8888/ 0x004C231C`
+  - Incorrect:
+    - `... RegisterGet eax=...`
+    - `... DebugSetBreakpoint addr=0x004C231C`
+- For frame-local values in a paused function, prefer `MiscParseExpression("[ebp-0x2c]")` or `MiscParseExpression("[rsp+8]")` over `StackPeek`.
+  - `StackPeek` is indexed relative to the current stack top.
+  - It is useful for stack-top inspection, but it is not a stable shorthand for frame locals across every paused state.
+- `RegisterDump` is the preferred way to capture a consistent paused-state register snapshot.
+- `GetBreakpointList` can lag briefly behind recent breakpoint mutations.
+  - Safe pattern: mutate debugger state -> wait briefly -> query state.
+
 Typical local usage:
 
 ```bash
@@ -287,6 +428,14 @@ With an explicit debugger URL:
 
 ```bash
 X64DBG_URL=http://192.168.1.212:8888/ x64dbgvenv/bin/python x64dbg.py
+```
+
+Examples with positional tool arguments:
+
+```bash
+x64dbgvenv/bin/python x64dbg.py RegisterGet --x64dbg-url http://192.168.1.212:8888/ eax
+x64dbgvenv/bin/python x64dbg.py MiscParseExpression --x64dbg-url http://192.168.1.212:8888/ "[ebp-0x2c]"
+x64dbgvenv/bin/python x64dbg.py GetRegisterDump --x64dbg-url http://192.168.1.212:8888/
 ```
 
 For GUI targets or any target expected to keep running, prefer the async wrappers:
