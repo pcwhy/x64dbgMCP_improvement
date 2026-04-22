@@ -188,7 +188,7 @@ http://<vm-ip>:8888/Health
 Example:
 
 ```text
-http://192.168.1.212:8888/Health
+http://192.168.79.128:8888/Health
 ```
 
 To change the port:
@@ -259,6 +259,44 @@ Example response:
 }
 ```
 
+## Legacy Breakpoint Action Caveats
+
+This fork still exposes the older breakpoint-management surface through x64dbg commands and `/Breakpoint/List`, but real-world tracing showed that the legacy GUI breakpoint action workflow is not a reliable source of truth for remote automation.
+
+Observed problems during MusicBox15 reverse-engineering:
+
+- `Breakpoint/List` only reports the configured breakpoint fields such as `breakCondition`, `logText`, and `commandText`. It does not prove that x64dbg actually evaluated those fields the way the GUI suggests at runtime.
+- Complex breakpoint conditions could be present in `Breakpoint/List` and still behave inconsistently at execution time.
+- GUI-side `log` / `pause` behavior depended on which condition field was used (`breakCondition`, log condition, command condition), and those layers were not trustworthy enough for bridge-driven auditing.
+- Scraping the x64dbg GUI log window is brittle and should not be treated as a stable machine-readable API.
+
+Practical guidance:
+
+- Prefer `/Log/Recent` and `/Log/Clear` for breakpoint-hit auditing.
+- Treat `/Breakpoint/List` as configuration/state introspection, not as proof that a breakpoint command or condition executed as intended.
+- If you must use `SetBreakpointCommand` or `SetBreakpointLog`, quote the full text payload explicitly. For example:
+
+```text
+SetBreakpointCommand 0x004C223B,"log \"probe cmd with spaces\""
+SetBreakpointLog 0x004C223B,"probe log with spaces"
+```
+
+- `SetBreakpointSilent` has an additional practical quirk in this workflow:
+  - `SetBreakpointSilent addr,1` reliably enabled the flag.
+  - `SetBreakpointSilent addr,0` did not reliably clear it.
+  - On a plain breakpoint with no extra breakpoint metadata, `SetBreakpointSilent addr` (omitting `arg2`) could clear it.
+  - Once breakpoint metadata such as a custom condition, log text, or command text had been configured, the silent flag could remain sticky even after trying to clear it remotely.
+- Because of that behavior, this fork now provides a dedicated verified endpoint for software breakpoints:
+
+```text
+/Breakpoint/SetSilent?addr=0x004C223B&silent=true
+/Breakpoint/SetSilent?addr=0x004C223B&silent=false
+```
+
+The endpoint retries the known x64dbg command variants internally and then verifies the final state through `Breakpoint/List`.
+
+- For new automation work, prefer plugin-captured callback events over GUI log scraping or GUI-only conditional actions.
+
 ## Debug Run Behavior
 
 The synchronous debug control endpoints are intentionally disabled:
@@ -288,7 +326,7 @@ Use the async endpoints instead:
 Example:
 
 ```text
-http://192.168.1.212:8888/Debug/RunAsync
+http://192.168.79.128:8888/Debug/RunAsync
 ```
 
 Expected response:
@@ -375,7 +413,7 @@ The improved plugin has been tested in this workflow:
 - Debugger: x32dbg inside a Windows VM.
 - Target: 32-bit Windows executable.
 - Plugin: `MCPx64dbg.dp32`.
-- LAN endpoint: `http://192.168.1.212:8888/`.
+- LAN endpoint: `http://192.168.79.128:8888/`.
 
 Observed behavior:
 
@@ -406,8 +444,8 @@ Operational notes that mattered in practice:
   - If a one-off helper blindly `json.loads()` every `200 OK` body, it will mis-handle these endpoints.
 - The CLI wrapper uses positional arguments, not `key=value` pairs.
   - Correct:
-    - `x64dbgvenv/bin/python x64dbg.py RegisterGet --x64dbg-url http://192.168.1.212:8888/ eax`
-    - `x64dbgvenv/bin/python x64dbg.py DebugSetBreakpoint --x64dbg-url http://192.168.1.212:8888/ 0x004C231C`
+    - `x64dbgvenv/bin/python x64dbg.py RegisterGet --x64dbg-url http://192.168.79.128:8888/ eax`
+    - `x64dbgvenv/bin/python x64dbg.py DebugSetBreakpoint --x64dbg-url http://192.168.79.128:8888/ 0x004C231C`
   - Incorrect:
     - `... RegisterGet eax=...`
     - `... DebugSetBreakpoint addr=0x004C231C`
@@ -427,15 +465,15 @@ x64dbgvenv/bin/python x64dbg.py
 With an explicit debugger URL:
 
 ```bash
-X64DBG_URL=http://192.168.1.212:8888/ x64dbgvenv/bin/python x64dbg.py
+X64DBG_URL=http://192.168.79.128:8888/ x64dbgvenv/bin/python x64dbg.py
 ```
 
 Examples with positional tool arguments:
 
 ```bash
-x64dbgvenv/bin/python x64dbg.py RegisterGet --x64dbg-url http://192.168.1.212:8888/ eax
-x64dbgvenv/bin/python x64dbg.py MiscParseExpression --x64dbg-url http://192.168.1.212:8888/ "[ebp-0x2c]"
-x64dbgvenv/bin/python x64dbg.py GetRegisterDump --x64dbg-url http://192.168.1.212:8888/
+x64dbgvenv/bin/python x64dbg.py RegisterGet --x64dbg-url http://192.168.79.128:8888/ eax
+x64dbgvenv/bin/python x64dbg.py MiscParseExpression --x64dbg-url http://192.168.79.128:8888/ "[ebp-0x2c]"
+x64dbgvenv/bin/python x64dbg.py GetRegisterDump --x64dbg-url http://192.168.79.128:8888/
 ```
 
 For GUI targets or any target expected to keep running, prefer the async wrappers:
