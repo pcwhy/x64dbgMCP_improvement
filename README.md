@@ -209,7 +209,7 @@ The plugin now keeps a small in-memory event buffer that remote clients can read
 
 Current event kinds:
 
-- `breakpoint`: emitted from the official `CB_BREAKPOINT` plugin callback and includes breakpoint metadata such as address, hit count, conditions, and configured log/command text.
+- `breakpoint`: emitted from the official `CB_BREAKPOINT` plugin callback and includes breakpoint metadata such as address, hit count, conditions, configured log/command text, plus any caller-configured watched expressions when that feature is enabled.
 - `output_debug_string`: emitted from `CB_OUTPUTDEBUGSTRING` when the debuggee calls `OutputDebugString`.
 
 Read the newest buffered entries:
@@ -234,6 +234,27 @@ Clear the buffer explicitly:
 
 ```text
 /Log/Clear
+```
+
+Optional watched expressions for breakpoint events can be configured at runtime.
+The format is newline- or semicolon-separated `label=expression` pairs.
+
+Set a MusicBox15-specific context profile:
+
+```text
+/Log/BreakpointContext/Set?items=writerTick=[ebp-0x0c];var24=[ebp-0x24];var2c=[ebp-0x2c]
+```
+
+List the currently configured expressions:
+
+```text
+/Log/BreakpointContext/List
+```
+
+Clear them and return to generic breakpoint events:
+
+```text
+/Log/BreakpointContext/Clear
 ```
 
 Example response:
