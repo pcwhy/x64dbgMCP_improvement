@@ -114,6 +114,7 @@ void parseHttpRequest(const std::string& request, std::string& method, std::stri
 std::unordered_map<std::string, std::string> parseQueryParams(const std::string& query);
 std::string urlDecode(const std::string& str);
 std::string escapeJsonString(const char* str);
+static void trimParam(std::string& s);
 bool resolveListenAddress(const std::string& host, sockaddr_in& serverAddr);
 std::string debugActionName(DebugAction action);
 std::string breakpointTypeName(BPXTYPE type);
