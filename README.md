@@ -287,7 +287,9 @@ This fork still exposes the older breakpoint-management surface through x64dbg c
 Observed problems during MusicBox15 reverse-engineering:
 
 - `Breakpoint/List` only reports the configured breakpoint fields such as `breakCondition`, `logText`, and `commandText`. It does not prove that x64dbg actually evaluated those fields the way the GUI suggests at runtime.
+- `Breakpoint/List` now also returns `logCondition` and `commandCondition`, which helps explain GUI states where those condition fields remain populated even after the corresponding command or log text has been cleared.
 - Complex breakpoint conditions could be present in `Breakpoint/List` and still behave inconsistently at execution time.
+- This fork does not re-evaluate breakpoint conditions inside the plugin. It records the `BRIDGEBP` fields returned by x64dbg and the later `CB_BREAKPOINT` callback that x64dbg emits. If those two disagree, the mismatch is in the underlying x64dbg breakpoint/action behavior, not in the plugin's event buffer.
 - GUI-side `log` / `pause` behavior depended on which condition field was used (`breakCondition`, log condition, command condition), and those layers were not trustworthy enough for bridge-driven auditing.
 - Scraping the x64dbg GUI log window is brittle and should not be treated as a stable machine-readable API.
 
@@ -315,6 +317,45 @@ SetBreakpointLog 0x004C223B,"probe log with spaces"
 ```
 
 The endpoint retries the known x64dbg command variants internally and then verifies the final state through `Breakpoint/List`.
+
+### Software Breakpoint Read/Write Endpoints
+
+To reduce reliance on raw `ExecCommand`, this fork now exposes a software-breakpoint endpoint family that mirrors the official x64dbg manual commands for software breakpoints:
+
+```text
+/Breakpoint/Get?addr=0x004C223B
+/Breakpoint/Set?addr=0x004C223B
+/Breakpoint/Delete?addr=0x004C223B
+/Breakpoint/SetEnabled?addr=0x004C223B&enabled=true
+/Breakpoint/SetName?addr=0x004C223B&name=writer_probe
+/Breakpoint/SetCondition?addr=0x004C223B&condition=[ebp-0x0c]==0x4D10
+/Breakpoint/SetLog?addr=0x004C223B&text=WT_19728
+/Breakpoint/SetLogCondition?addr=0x004C223B&condition=eax==0x42
+/Breakpoint/SetCommand?addr=0x004C223B&text=pause
+/Breakpoint/SetCommandCondition?addr=0x004C223B&condition=eax==0x42
+/Breakpoint/SetFastResume?addr=0x004C223B&enabled=true
+/Breakpoint/SetSingleshoot?addr=0x004C223B&enabled=true
+/Breakpoint/SetSilent?addr=0x004C223B&silent=true
+/Breakpoint/GetHitCount?addr=0x004C223B
+```
+
+These endpoints intentionally stay close to the official command set:
+
+- `SetBreakpointName`
+- `SetBreakpointCondition`
+- `SetBreakpointLog`
+- `SetBreakpointLogCondition`
+- `SetBreakpointCommand`
+- `SetBreakpointCommandCondition`
+- `SetBreakpointFastResume`
+- `SetBreakpointSingleshoot`
+- `SetBreakpointSilent`
+
+The plugin still delegates the actual mutation to x64dbg's own breakpoint commands, but the bridge now:
+
+- gives you a structured readback path through `/Breakpoint/Get` and `/Breakpoint/List`
+- exposes `logCondition` and `commandCondition` in JSON
+- returns the post-command breakpoint object so bridge-side automation can inspect what x64dbg actually stored
 
 - For new automation work, prefer plugin-captured callback events over GUI log scraping or GUI-only conditional actions.
 
