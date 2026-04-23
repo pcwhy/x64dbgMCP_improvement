@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 
@@ -33,31 +34,102 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CONTEXT_ITEMS,
         help="Semicolon-separated watched expressions appended to breakpoint events.",
     )
+    parser.add_argument(
+        "--settle-ms",
+        type=int,
+        default=120,
+        help="Sleep briefly after each breakpoint mutation to let x64dbg state settle.",
+    )
+    parser.add_argument(
+        "--verify-timeout-ms",
+        type=int,
+        default=3000,
+        help="How long to wait for the final breakpoint state to match expectations.",
+    )
     parser.add_argument("--no-clear-log", action="store_true", help="Do not clear the event log after setup.")
     return parser.parse_args()
 
 
-def configure_breakpoint(x64dbg, addr: str, name: str, log_text: str) -> dict[str, object]:
-    steps = [
-        x64dbg.BreakpointSet(addr),
-        x64dbg.BreakpointSetName(addr, name),
-        x64dbg.BreakpointSetCondition(addr, "1"),
-        x64dbg.BreakpointSetLog(addr, log_text),
-        x64dbg.BreakpointSetLogCondition(addr, ""),
-        x64dbg.BreakpointSetCommand(addr, "$breakpointcondition=0"),
-        x64dbg.BreakpointSetCommandCondition(addr, ""),
-        x64dbg.BreakpointSetFastResume(addr, "false"),
-        x64dbg.BreakpointSetSingleshoot(addr, "false"),
-        x64dbg.BreakpointSetSilent(addr, True),
-        x64dbg.BreakpointSetEnabled(addr, "true"),
-        x64dbg.BreakpointGet(addr),
+def _sleep_ms(settle_ms: int) -> None:
+    if settle_ms > 0:
+        time.sleep(settle_ms / 1000.0)
+
+
+def _matches_expected(final_state: dict[str, object], *, name: str, log_text: str) -> bool:
+    if not isinstance(final_state, dict):
+        return False
+    if final_state.get("enabled") is not True:
+        return False
+    if final_state.get("name") != name:
+        return False
+    if final_state.get("breakCondition") != "1":
+        return False
+    if final_state.get("logText") != log_text:
+        return False
+    if final_state.get("commandText") != "$breakpointcondition=0":
+        return False
+    if final_state.get("silent") is not True:
+        return False
+    return True
+
+
+def _poll_breakpoint(x64dbg, addr: str, *, name: str, log_text: str, verify_timeout_ms: int, settle_ms: int) -> tuple[dict[str, object], bool]:
+    deadline = time.time() + max(0, verify_timeout_ms) / 1000.0
+    last_state: dict[str, object] = {}
+    while True:
+        state = x64dbg.BreakpointGet(addr)
+        if isinstance(state, dict):
+            last_state = state
+            if _matches_expected(state, name=name, log_text=log_text):
+                return state, True
+        if time.time() >= deadline:
+            return last_state, False
+        _sleep_ms(max(20, settle_ms))
+
+
+def configure_breakpoint(
+    x64dbg,
+    addr: str,
+    name: str,
+    log_text: str,
+    *,
+    settle_ms: int,
+    verify_timeout_ms: int,
+) -> dict[str, object]:
+    steps = []
+    mutators = [
+        ("set", lambda: x64dbg.BreakpointSet(addr)),
+        ("name", lambda: x64dbg.BreakpointSetName(addr, name)),
+        ("condition", lambda: x64dbg.BreakpointSetCondition(addr, "1")),
+        ("log", lambda: x64dbg.BreakpointSetLog(addr, log_text)),
+        ("log_condition", lambda: x64dbg.BreakpointSetLogCondition(addr, "")),
+        ("command", lambda: x64dbg.BreakpointSetCommand(addr, "$breakpointcondition=0")),
+        ("command_condition", lambda: x64dbg.BreakpointSetCommandCondition(addr, "")),
+        ("fast_resume", lambda: x64dbg.BreakpointSetFastResume(addr, "false")),
+        ("singleshoot", lambda: x64dbg.BreakpointSetSingleshoot(addr, "false")),
+        ("silent", lambda: x64dbg.BreakpointSetSilent(addr, True)),
+        ("enabled", lambda: x64dbg.BreakpointSetEnabled(addr, "true")),
     ]
+    for label, fn in mutators:
+        result = fn()
+        steps.append({"step": label, "result": result})
+        _sleep_ms(settle_ms)
+
+    final_state, verified = _poll_breakpoint(
+        x64dbg,
+        addr,
+        name=name,
+        log_text=log_text,
+        verify_timeout_ms=verify_timeout_ms,
+        settle_ms=settle_ms,
+    )
     return {
         "addr": addr,
         "name": name,
         "logText": log_text,
         "steps": steps,
-        "final": steps[-1],
+        "verified": verified,
+        "final": final_state,
     }
 
 
@@ -70,15 +142,43 @@ def main() -> None:
 
     configured = []
     context_result = x64dbg.SetBreakpointContextExpressions(args.context_items)
-    configured.append(configure_breakpoint(x64dbg, args.translate_addr, "msg_translate", "MSG_Translate"))
+    _sleep_ms(args.settle_ms)
+    configured.append(
+        configure_breakpoint(
+            x64dbg,
+            args.translate_addr,
+            "msg_translate",
+            "MSG_Translate",
+            settle_ms=args.settle_ms,
+            verify_timeout_ms=args.verify_timeout_ms,
+        )
+    )
     if args.peek_addr:
-        configured.append(configure_breakpoint(x64dbg, args.peek_addr, "msg_peek", "MSG_PeekW"))
+        configured.append(
+            configure_breakpoint(
+                x64dbg,
+                args.peek_addr,
+                "msg_peek",
+                "MSG_PeekW",
+                settle_ms=args.settle_ms,
+                verify_timeout_ms=args.verify_timeout_ms,
+            )
+        )
     if args.dispatch_addr:
-        configured.append(configure_breakpoint(x64dbg, args.dispatch_addr, "msg_dispatch_marker", "MSG_DispatchMarker"))
+        configured.append(
+            configure_breakpoint(
+                x64dbg,
+                args.dispatch_addr,
+                "msg_dispatch_marker",
+                "MSG_DispatchMarker",
+                settle_ms=args.settle_ms,
+                verify_timeout_ms=args.verify_timeout_ms,
+            )
+        )
 
     clear_result = None if args.no_clear_log else x64dbg.ClearLog()
     print(json.dumps({
-        "success": True,
+        "success": all(bp.get("verified") for bp in configured),
         "context": context_result,
         "breakpoints": configured,
         "clearLog": clear_result,
