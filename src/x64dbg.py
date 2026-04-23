@@ -52,9 +52,10 @@ def _decode_response(response: requests.Response) -> Any:
 def _request(method: str, endpoint: str, **kwargs):
     url = _endpoint_url(endpoint)
     last_error: Exception | None = None
+    timeout = kwargs.pop("timeout", 15)
     for attempt in range(3):
         try:
-            response = requests.request(method, url, timeout=kwargs.pop("timeout", 15), **kwargs)
+            response = requests.request(method, url, timeout=timeout, **kwargs)
             if response.ok:
                 return _decode_response(response)
             return f"Error {response.status_code}: {response.text.strip()}"
@@ -67,14 +68,14 @@ def _request(method: str, endpoint: str, **kwargs):
             return f"Request failed: {str(exc)}"
     return f"Request failed: {str(last_error)}"
 
-def safe_get(endpoint: str, params: dict = None):
+def safe_get(endpoint: str, params: dict = None, timeout: float = 15):
     """
     Perform a GET request with optional query parameters.
     Returns parsed JSON if possible, otherwise text content
     """
     if params is None:
         params = {}
-    return _request("GET", endpoint, params=params, timeout=15)
+    return _request("GET", endpoint, params=params, timeout=timeout)
 
 def safe_post(endpoint: str, data: dict | str):
     """
@@ -320,6 +321,8 @@ def HostExec(program: str, args: str = "", cwd: str = "", timeout_ms: int = 3000
         - timedOut
         - job: Host job metadata and current status
     """
+    # Keep the client-side HTTP read timeout longer than the server-side job wait.
+    request_timeout = max(15.0, float(timeout_ms) / 1000.0 + 10.0)
     result = safe_get(
         "Host/Exec",
         {
@@ -328,6 +331,7 @@ def HostExec(program: str, args: str = "", cwd: str = "", timeout_ms: int = 3000
             "cwd": cwd,
             "timeoutMs": timeout_ms,
         },
+        timeout=request_timeout,
     )
     if isinstance(result, dict):
         return result
