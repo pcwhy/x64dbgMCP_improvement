@@ -1,4 +1,4 @@
-# x64dbgMCP Improved
+# x64dbgMCP++
 
 This repository contains a patched and extended build of the x64dbg MCP/HTTP plugin used for remote-assisted x32dbg/x64dbg debugging.
 
