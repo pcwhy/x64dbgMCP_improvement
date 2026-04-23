@@ -302,6 +302,56 @@ Example response:
 }
 ```
 
+## Host Process Execution
+
+The plugin can now launch a Windows host-side process without going through
+`cmd.exe`. This is intended for tightly scoped helper tasks such as replaying a
+captured UI action script.
+
+Available endpoints:
+
+- `/Host/Spawn`
+- `/Host/Exec`
+- `/Host/Job/Get`
+- `/Host/Job/Kill`
+
+Common parameters:
+
+- `program`: executable path on the Windows host
+- `args`: raw command-line argument tail appended after the quoted program
+- `cwd`: optional working directory
+
+Start asynchronously:
+
+```text
+/Host/Spawn?program=C:\Python314\python.exe&args=C:\work\scripts\replay_message_replayish.py%20C:\work\tmp\capture_export.json&cwd=C:\work
+```
+
+Execute and wait up to `timeoutMs`:
+
+```text
+/Host/Exec?program=C:\Python314\python.exe&args=C:\work\scripts\replay_message_replayish.py%20C:\work\tmp\capture_export.json%20--dry-run&cwd=C:\work&timeoutMs=30000
+```
+
+Read job state:
+
+```text
+/Host/Job/Get?id=1
+```
+
+Terminate a running job:
+
+```text
+/Host/Job/Kill?id=1
+```
+
+Notes:
+
+- `args` is treated as a raw command-line tail, so callers must quote any
+  individual argument that contains spaces.
+- stdout and stderr are currently merged into the returned `output` field.
+- This is intentionally a host-process interface, not a shell interface.
+
 ## Legacy Breakpoint Action Caveats
 
 This fork still exposes the older breakpoint-management surface through x64dbg commands and `/Breakpoint/List`, but real-world tracing showed that the legacy GUI breakpoint action workflow is not a reliable source of truth for remote automation.
