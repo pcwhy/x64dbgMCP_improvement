@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <optional>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -126,6 +127,10 @@ void setBreakpointContextExpressions(const std::vector<BreakpointContextExpressi
 std::vector<BreakpointContextExpression> parseBreakpointContextSpec(const std::string& spec);
 bool getBreakpointByAddress(duint addr, BRIDGEBP& outBp);
 std::string formatBreakpointAddress(duint addr);
+std::string quoteCommandArgument(const std::string& value);
+std::string buildBreakpointCommand(const std::string& commandName, const std::string& addrText, const std::optional<std::string>& value, bool quoteValue);
+void appendBreakpointJson(std::ostringstream& ss, const BRIDGEBP& bp, const char* forcedType = nullptr);
+bool applyBreakpointCommandSequence(duint addr, const std::vector<std::string>& commands, std::string& attemptsSummary, BRIDGEBP& finalBp);
 bool applyBreakpointSilentFlag(duint addr, bool silent, std::string& attemptsSummary, bool& finalSilent);
 void appendEventLog(const std::string& kind, const std::string& text);
 std::string trimForLog(const std::string& text);
@@ -338,6 +343,90 @@ std::string formatBreakpointAddress(duint addr) {
     return ss.str();
 }
 
+std::string quoteCommandArgument(const std::string& value) {
+    std::string quoted;
+    quoted.reserve(value.size() + 2);
+    quoted.push_back('"');
+    for (char ch : value) {
+        if (ch == '"' || ch == '\\') {
+            quoted.push_back('\\');
+        }
+        quoted.push_back(ch);
+    }
+    quoted.push_back('"');
+    return quoted;
+}
+
+std::string buildBreakpointCommand(const std::string& commandName, const std::string& addrText, const std::optional<std::string>& value, bool quoteValue) {
+    if (!value.has_value()) {
+        return commandName + " " + addrText;
+    }
+    if (quoteValue) {
+        return commandName + " " + addrText + "," + quoteCommandArgument(*value);
+    }
+    return commandName + " " + addrText + "," + *value;
+}
+
+void appendBreakpointJson(std::ostringstream& ss, const BRIDGEBP& bp, const char* forcedType) {
+    const char* bpTypeStr = forcedType ? forcedType : "unknown";
+    if (!forcedType) {
+        switch (bp.type) {
+            case bp_normal:    bpTypeStr = "normal"; break;
+            case bp_hardware:  bpTypeStr = "hardware"; break;
+            case bp_memory:    bpTypeStr = "memory"; break;
+            case bp_dll:       bpTypeStr = "dll"; break;
+            case bp_exception: bpTypeStr = "exception"; break;
+            default: break;
+        }
+    }
+
+    ss << "{"
+       << "\"type\":\"" << bpTypeStr << "\","
+       << "\"addr\":\"0x" << std::hex << bp.addr << "\","
+       << "\"enabled\":" << (bp.enabled ? "true" : "false") << ","
+       << "\"singleshoot\":" << (bp.singleshoot ? "true" : "false") << ","
+       << "\"active\":" << (bp.active ? "true" : "false") << ","
+       << "\"name\":\"" << escapeJsonString(bp.name) << "\","
+       << "\"module\":\"" << escapeJsonString(bp.mod) << "\","
+       << "\"hitCount\":" << std::dec << bp.hitCount << ","
+       << "\"fastResume\":" << (bp.fastResume ? "true" : "false") << ","
+       << "\"silent\":" << (bp.silent ? "true" : "false") << ","
+       << "\"breakCondition\":\"" << escapeJsonString(bp.breakCondition) << "\","
+       << "\"logText\":\"" << escapeJsonString(bp.logText) << "\","
+       << "\"logCondition\":\"" << escapeJsonString(bp.logCondition) << "\","
+       << "\"commandText\":\"" << escapeJsonString(bp.commandText) << "\","
+       << "\"commandCondition\":\"" << escapeJsonString(bp.commandCondition) << "\""
+       << "}";
+}
+
+bool applyBreakpointCommandSequence(duint addr, const std::vector<std::string>& commands, std::string& attemptsSummary, BRIDGEBP& finalBp) {
+    std::ostringstream attempts;
+    bool applied = false;
+    bool foundAny = false;
+    memset(&finalBp, 0, sizeof(finalBp));
+
+    for (size_t i = 0; i < commands.size(); i++) {
+        const bool execOk = DbgCmdExecDirect(commands[i].c_str());
+        BRIDGEBP bp;
+        bool found = getBreakpointByAddress(addr, bp);
+        if (found) {
+            finalBp = bp;
+            foundAny = true;
+        }
+        if (i != 0) {
+            attempts << " | ";
+        }
+        attempts << commands[i] << " -> exec=" << (execOk ? "1" : "0")
+                 << ",found=" << (found ? "1" : "0");
+        if (execOk && found) {
+            applied = true;
+        }
+    }
+
+    attemptsSummary = attempts.str();
+    return applied && foundAny;
+}
+
 bool applyBreakpointSilentFlag(duint addr, bool silent, std::string& attemptsSummary, bool& finalSilent) {
     std::vector<std::string> commands;
     const std::string addrText = formatBreakpointAddress(addr);
@@ -488,6 +577,12 @@ void cbBreakpointEvent(CBTYPE bType, void* callbackInfo) {
     }
     if (bp.commandText[0] != '\0') {
         ss << " commandText=" << bp.commandText;
+    }
+    if (bp.logCondition[0] != '\0') {
+        ss << " logCondition=" << bp.logCondition;
+    }
+    if (bp.commandCondition[0] != '\0') {
+        ss << " commandCondition=" << bp.commandCondition;
     }
     const auto expressions = getBreakpointContextExpressions();
     for (const auto& item : expressions) {
@@ -1351,6 +1446,250 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     bool success = Script::Debug::DeleteBreakpoint(addr);
                     sendHttpResponse(clientSocket, success ? 200 : 500, "text/plain", 
                         success ? "Breakpoint deleted successfully" : "Failed to delete breakpoint");
+                }
+                else if (path == "/Breakpoint/Get") {
+                    std::string addrStr = queryParams["addr"];
+                    if (addrStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'addr' parameter\"}");
+                        continue;
+                    }
+
+                    duint addr = 0;
+                    if (!tryParseHexAddress(addrStr, addr)) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Invalid address format\"}");
+                        continue;
+                    }
+
+                    BRIDGEBP bp;
+                    if (!getBreakpointByAddress(addr, bp)) {
+                        sendHttpResponse(clientSocket, 404, "application/json",
+                            "{\"error\":\"Breakpoint not found\"}");
+                        continue;
+                    }
+
+                    std::ostringstream ss;
+                    appendBreakpointJson(ss, bp, "normal");
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Breakpoint/Set") {
+                    std::string addrStr = queryParams["addr"];
+                    if (addrStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'addr' parameter\"}");
+                        continue;
+                    }
+
+                    duint addr = 0;
+                    if (!tryParseHexAddress(addrStr, addr)) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Invalid address format\"}");
+                        continue;
+                    }
+
+                    BRIDGEBP existing;
+                    bool existed = getBreakpointByAddress(addr, existing);
+                    bool created = existed ? true : Script::Debug::SetBreakpoint(addr);
+                    if (!created) {
+                        sendHttpResponse(clientSocket, 500, "application/json",
+                            "{\"error\":\"Failed to create breakpoint\"}");
+                        continue;
+                    }
+
+                    BRIDGEBP bp;
+                    if (!getBreakpointByAddress(addr, bp)) {
+                        sendHttpResponse(clientSocket, 500, "application/json",
+                            "{\"error\":\"Breakpoint was created but could not be read back\"}");
+                        continue;
+                    }
+
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"success\":true,"
+                       << "\"created\":" << (existed ? "false" : "true") << ","
+                       << "\"breakpoint\":";
+                    appendBreakpointJson(ss, bp, "normal");
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Breakpoint/Delete") {
+                    std::string addrStr = queryParams["addr"];
+                    if (addrStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'addr' parameter\"}");
+                        continue;
+                    }
+
+                    duint addr = 0;
+                    if (!tryParseHexAddress(addrStr, addr)) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Invalid address format\"}");
+                        continue;
+                    }
+
+                    bool success = Script::Debug::DeleteBreakpoint(addr);
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"success\":" << (success ? "true" : "false") << ","
+                       << "\"addr\":\"" << formatBreakpointAddress(addr) << "\""
+                       << "}";
+                    sendHttpResponse(clientSocket, success ? 200 : 500, "application/json", ss.str());
+                }
+                else if (path == "/Breakpoint/SetEnabled") {
+                    std::string addrStr = queryParams["addr"];
+                    std::string enabledStr = queryParams["enabled"];
+                    if (addrStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'addr' parameter\"}");
+                        continue;
+                    }
+
+                    duint addr = 0;
+                    if (!tryParseHexAddress(addrStr, addr)) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Invalid address format\"}");
+                        continue;
+                    }
+
+                    std::string enabledLower = enabledStr;
+                    std::transform(enabledLower.begin(), enabledLower.end(), enabledLower.begin(), ::tolower);
+                    bool enabled = !(enabledLower == "0" || enabledLower == "false" || enabledLower == "off" || enabledLower == "no");
+
+                    const std::string addrText = formatBreakpointAddress(addr);
+                    std::vector<std::string> commands;
+                    commands.push_back(enabled ? ("EnableBPX " + addrText) : ("DisableBPX " + addrText));
+                    BRIDGEBP bp;
+                    std::string attemptsSummary;
+                    bool applied = applyBreakpointCommandSequence(addr, commands, attemptsSummary, bp);
+
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"success\":" << (applied ? "true" : "false") << ","
+                       << "\"addr\":\"" << addrText << "\","
+                       << "\"requestedEnabled\":" << (enabled ? "true" : "false") << ","
+                       << "\"attempts\":\"" << escapeJsonString(attemptsSummary.c_str()) << "\","
+                       << "\"breakpoint\":";
+                    appendBreakpointJson(ss, bp, "normal");
+                    ss << "}";
+                    sendHttpResponse(clientSocket, applied ? 200 : 409, "application/json", ss.str());
+                }
+                else if (path == "/Breakpoint/SetName" ||
+                         path == "/Breakpoint/SetCondition" ||
+                         path == "/Breakpoint/SetLog" ||
+                         path == "/Breakpoint/SetLogCondition" ||
+                         path == "/Breakpoint/SetCommand" ||
+                         path == "/Breakpoint/SetCommandCondition" ||
+                         path == "/Breakpoint/SetFastResume" ||
+                         path == "/Breakpoint/SetSingleshoot") {
+                    std::string addrStr = queryParams["addr"];
+                    if (addrStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'addr' parameter\"}");
+                        continue;
+                    }
+
+                    duint addr = 0;
+                    if (!tryParseHexAddress(addrStr, addr)) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Invalid address format\"}");
+                        continue;
+                    }
+
+                    BRIDGEBP existing;
+                    if (!getBreakpointByAddress(addr, existing)) {
+                        sendHttpResponse(clientSocket, 404, "application/json",
+                            "{\"error\":\"Breakpoint not found\"}");
+                        continue;
+                    }
+
+                    const std::string addrText = formatBreakpointAddress(addr);
+                    std::vector<std::string> commands;
+
+                    auto hasParam = [&](const char* key) {
+                        return queryParams.find(key) != queryParams.end();
+                    };
+                    auto getOptionalText = [&](const char* key) -> std::optional<std::string> {
+                        if (!hasParam(key)) {
+                            return std::nullopt;
+                        }
+                        return urlDecode(queryParams[key]);
+                    };
+
+                    if (path == "/Breakpoint/SetName") {
+                        std::optional<std::string> value = getOptionalText("name");
+                        commands.push_back(buildBreakpointCommand("SetBreakpointName", addrText, value && value->empty() ? std::optional<std::string>() : value, true));
+                    } else if (path == "/Breakpoint/SetCondition") {
+                        std::optional<std::string> value = getOptionalText("condition");
+                        commands.push_back(buildBreakpointCommand("SetBreakpointCondition", addrText, value && value->empty() ? std::optional<std::string>() : value, true));
+                    } else if (path == "/Breakpoint/SetLog") {
+                        std::optional<std::string> value = getOptionalText("text");
+                        commands.push_back(buildBreakpointCommand("SetBreakpointLog", addrText, value && value->empty() ? std::optional<std::string>() : value, true));
+                    } else if (path == "/Breakpoint/SetLogCondition") {
+                        std::optional<std::string> value = getOptionalText("condition");
+                        commands.push_back(buildBreakpointCommand("SetBreakpointLogCondition", addrText, value && value->empty() ? std::optional<std::string>() : value, true));
+                    } else if (path == "/Breakpoint/SetCommand") {
+                        std::optional<std::string> value = getOptionalText("text");
+                        commands.push_back(buildBreakpointCommand("SetBreakpointCommand", addrText, value && value->empty() ? std::optional<std::string>() : value, true));
+                    } else if (path == "/Breakpoint/SetCommandCondition") {
+                        std::optional<std::string> value = getOptionalText("condition");
+                        commands.push_back(buildBreakpointCommand("SetBreakpointCommandCondition", addrText, value && value->empty() ? std::optional<std::string>() : value, true));
+                    } else if (path == "/Breakpoint/SetFastResume") {
+                        std::string enabledStr = queryParams["enabled"];
+                        std::string enabledLower = enabledStr;
+                        std::transform(enabledLower.begin(), enabledLower.end(), enabledLower.begin(), ::tolower);
+                        bool enabled = !(enabledLower == "0" || enabledLower == "false" || enabledLower == "off" || enabledLower == "no");
+                        commands.push_back(buildBreakpointCommand("SetBreakpointFastResume", addrText, std::optional<std::string>(enabled ? "1" : "0"), false));
+                    } else if (path == "/Breakpoint/SetSingleshoot") {
+                        std::string enabledStr = queryParams["enabled"];
+                        std::string enabledLower = enabledStr;
+                        std::transform(enabledLower.begin(), enabledLower.end(), enabledLower.begin(), ::tolower);
+                        bool enabled = !(enabledLower == "0" || enabledLower == "false" || enabledLower == "off" || enabledLower == "no");
+                        commands.push_back(buildBreakpointCommand("SetBreakpointSingleshoot", addrText, std::optional<std::string>(enabled ? "1" : "0"), false));
+                    }
+
+                    BRIDGEBP bp;
+                    std::string attemptsSummary;
+                    bool applied = applyBreakpointCommandSequence(addr, commands, attemptsSummary, bp);
+
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"success\":" << (applied ? "true" : "false") << ","
+                       << "\"addr\":\"" << addrText << "\","
+                       << "\"attempts\":\"" << escapeJsonString(attemptsSummary.c_str()) << "\","
+                       << "\"breakpoint\":";
+                    appendBreakpointJson(ss, bp, "normal");
+                    ss << "}";
+                    sendHttpResponse(clientSocket, applied ? 200 : 409, "application/json", ss.str());
+                }
+                else if (path == "/Breakpoint/GetHitCount") {
+                    std::string addrStr = queryParams["addr"];
+                    if (addrStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'addr' parameter\"}");
+                        continue;
+                    }
+
+                    duint addr = 0;
+                    if (!tryParseHexAddress(addrStr, addr)) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Invalid address format\"}");
+                        continue;
+                    }
+
+                    BRIDGEBP bp;
+                    if (!getBreakpointByAddress(addr, bp)) {
+                        sendHttpResponse(clientSocket, 404, "application/json",
+                            "{\"error\":\"Breakpoint not found\"}");
+                        continue;
+                    }
+
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"addr\":\"" << formatBreakpointAddress(addr) << "\","
+                       << "\"hitCount\":" << std::dec << bp.hitCount
+                       << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/Breakpoint/SetSilent") {
                     std::string addrStr = queryParams["addr"];
@@ -2303,31 +2642,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                             for (int i = 0; i < bpmap.count; i++) {
                                 if (totalEmitted > 0) ss << ",";
                                 BRIDGEBP& bp = bpmap.bp[i];
-                                
-                                const char* bpTypeStr = "unknown";
-                                switch (bp.type) {
-                                    case bp_normal:    bpTypeStr = "normal"; break;
-                                    case bp_hardware:  bpTypeStr = "hardware"; break;
-                                    case bp_memory:    bpTypeStr = "memory"; break;
-                                    case bp_dll:       bpTypeStr = "dll"; break;
-                                    case bp_exception: bpTypeStr = "exception"; break;
-                                    default: break;
-                                }
-                                
-                                ss << "{\"type\":\"" << bpTypeStr << "\","
-                                   << "\"addr\":\"0x" << std::hex << bp.addr << "\","
-                                   << "\"enabled\":" << (bp.enabled ? "true" : "false") << ","
-                                   << "\"singleshoot\":" << (bp.singleshoot ? "true" : "false") << ","
-                                   << "\"active\":" << (bp.active ? "true" : "false") << ","
-                                   << "\"name\":\"" << escapeJsonString(bp.name) << "\","
-                                   << "\"module\":\"" << escapeJsonString(bp.mod) << "\","
-                                   << "\"hitCount\":" << std::dec << bp.hitCount << ","
-                                   << "\"fastResume\":" << (bp.fastResume ? "true" : "false") << ","
-                                   << "\"silent\":" << (bp.silent ? "true" : "false") << ","
-                                   << "\"breakCondition\":\"" << escapeJsonString(bp.breakCondition) << "\","
-                                   << "\"logText\":\"" << escapeJsonString(bp.logText) << "\","
-                                   << "\"commandText\":\"" << escapeJsonString(bp.commandText) << "\""
-                                   << "}";
+                                appendBreakpointJson(ss, bp);
                                 totalEmitted++;
                             }
                             BridgeFree(bpmap.bp);

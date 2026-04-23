@@ -554,6 +554,201 @@ def DebugDeleteBreakpoint(addr: str) -> str:
 
 
 @mcp.tool()
+def BreakpointGet(addr: str) -> dict:
+    """
+    Read back a single software breakpoint and its current configured fields.
+
+    Parameters:
+        addr: Breakpoint address (hex format, e.g. "0x004C223B")
+    """
+    result = safe_get("Breakpoint/Get", {"addr": addr})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointSet(addr: str) -> dict:
+    """
+    Create a software breakpoint if missing and return its current state.
+    """
+    result = safe_get("Breakpoint/Set", {"addr": addr})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointDelete(addr: str) -> dict:
+    """
+    Delete a software breakpoint through the breakpoint endpoint family.
+    """
+    result = safe_get("Breakpoint/Delete", {"addr": addr})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointSetEnabled(addr: str, enabled: str = "true") -> dict:
+    """
+    Enable or disable a software breakpoint.
+    """
+    result = safe_get("Breakpoint/SetEnabled", {"addr": addr, "enabled": enabled})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointSetName(addr: str, name: str = "") -> dict:
+    """
+    Set or clear the name of a software breakpoint.
+    """
+    result = safe_get("Breakpoint/SetName", {"addr": addr, "name": name})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointSetCondition(addr: str, condition: str = "") -> dict:
+    """
+    Set or clear the break condition of a software breakpoint.
+    """
+    result = safe_get("Breakpoint/SetCondition", {"addr": addr, "condition": condition})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointSetLog(addr: str, text: str = "") -> dict:
+    """
+    Set or clear the log text of a software breakpoint.
+    """
+    result = safe_get("Breakpoint/SetLog", {"addr": addr, "text": text})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointSetLogCondition(addr: str, condition: str = "") -> dict:
+    """
+    Set or clear the log condition of a software breakpoint.
+    """
+    result = safe_get("Breakpoint/SetLogCondition", {"addr": addr, "condition": condition})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointSetCommand(addr: str, text: str = "") -> dict:
+    """
+    Set or clear the command text of a software breakpoint.
+    """
+    result = safe_get("Breakpoint/SetCommand", {"addr": addr, "text": text})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointSetCommandCondition(addr: str, condition: str = "") -> dict:
+    """
+    Set or clear the command condition of a software breakpoint.
+    """
+    result = safe_get("Breakpoint/SetCommandCondition", {"addr": addr, "condition": condition})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointSetFastResume(addr: str, enabled: str = "true") -> dict:
+    """
+    Enable or disable fast resume for a software breakpoint.
+    """
+    result = safe_get("Breakpoint/SetFastResume", {"addr": addr, "enabled": enabled})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointSetSingleshoot(addr: str, enabled: str = "true") -> dict:
+    """
+    Enable or disable singleshoot for a software breakpoint.
+    """
+    result = safe_get("Breakpoint/SetSingleshoot", {"addr": addr, "enabled": enabled})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
 def BreakpointSetSilent(addr: str, silent: bool = True) -> dict:
     """
     Set the silent flag for a software breakpoint using a plugin-side verified path.
@@ -581,6 +776,22 @@ def BreakpointSetSilent(addr: str, silent: bool = True) -> dict:
         try:
             return json.loads(result)
         except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def BreakpointGetHitCount(addr: str) -> dict:
+    """
+    Read the hit counter of a software breakpoint.
+    """
+    result = safe_get("Breakpoint/GetHitCount", {"addr": addr})
+    if isinstance(result, dict):
+        return result
+    elif isinstance(result, str):
+        try:
+            return json.loads(result)
+        except:
             return {"error": "Failed to parse response", "raw": result}
     return {"error": "Unexpected response format"}
 
@@ -1203,7 +1414,8 @@ def GetBreakpointList(type: str = "all") -> dict:
         Dictionary with:
         - count: Number of breakpoints
         - breakpoints: List of breakpoint objects with type, addr, enabled, singleshoot,
-          active, name, module, hitCount, fastResume, silent, breakCondition, logText, commandText
+          active, name, module, hitCount, fastResume, silent, breakCondition,
+          logText, logCondition, commandText, commandCondition
     """
     result = safe_get("Breakpoint/List", {"type": type})
     if isinstance(result, dict):
