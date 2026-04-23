@@ -34,9 +34,40 @@ This fork addresses those two issues while preserving the original command style
   - `/Debug/StepOutAsync`
 - Added a debug action worker thread so async run/step requests return immediately.
 - Added a plugin-side event buffer plus HTTP log endpoints so remote clients can read recent breakpoint/debug-string events without scraping the x64dbg GUI log window.
+- Extended `/Log/Recent` with pagination metadata, `since`-based forward reads, and `limit=-1` full-buffer reads.
+- Added configurable breakpoint-context expressions so callback events can include extra derived fields such as stack locals, registers, or decoded message-structure values.
+- Expanded the software-breakpoint HTTP surface from basic set/delete helpers into a fuller configuration API:
+  - `/Breakpoint/Get`
+  - `/Breakpoint/Set`
+  - `/Breakpoint/Delete`
+  - `/Breakpoint/SetEnabled`
+  - `/Breakpoint/SetName`
+  - `/Breakpoint/SetCondition`
+  - `/Breakpoint/SetLog`
+  - `/Breakpoint/SetLogCondition`
+  - `/Breakpoint/SetCommand`
+  - `/Breakpoint/SetCommandCondition`
+  - `/Breakpoint/SetFastResume`
+  - `/Breakpoint/SetSingleshoot`
+  - `/Breakpoint/SetSilent`
+  - `/Breakpoint/GetHitCount`
+- Extended breakpoint introspection so remote clients can read back `logCondition` and `commandCondition`, not just `breakCondition`, `logText`, and `commandText`.
+- Added a plugin-verified `SetSilent` path so remote callers can request and verify the final silent state instead of relying on raw x64dbg command behavior.
+- Added a Windows host-process execution surface:
+  - `/Host/Spawn`
+  - `/Host/Exec`
+  - `/Host/Job/Get`
+  - `/Host/Job/Kill`
+- Added Python-side bridge helpers for host execution and generic helper CLIs for:
+  - host process invocation
+  - message-capture initialization
+  - raw event-log fetch
+  - replay-oriented export
+  - high-level replay of exported pointer/click action scripts
 - Added a socket receive timeout to avoid stalled client connections blocking the HTTP thread.
 - Disabled the old synchronous `/Disasm/StepInWithDisasm` endpoint because it performed a direct step inside the HTTP request handler.
 - Fixed HTTP server start/stop state handling to avoid a potential self-lock/restart issue.
+- Fixed the `HostExec` client/server timeout mismatch so long-running successful jobs do not appear to fail just because the bridge-side HTTP read timeout was shorter than the requested host wait time.
 
 ## Safety Note
 
