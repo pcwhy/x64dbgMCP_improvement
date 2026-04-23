@@ -219,7 +219,7 @@ http://<vm-ip>:8888/Health
 Example:
 
 ```text
-http://192.168.79.128:8888/Health
+http://<vm-ip>:8888/Health
 ```
 
 To change the port:
@@ -288,6 +288,52 @@ Clear the buffer explicitly:
 - `nextSince`: sequence id to reuse as the next `since` value
 - `tail`: whether the request used newest-first truncation
 - `unlimited`: whether `limit=-1` was used
+
+### Recording While The Debuggee Keeps Running
+
+The most important usage pattern for this event buffer is full-speed logging:
+the target keeps running, x64dbg callback events keep accumulating, and the
+remote side reads the whole buffer afterward.
+
+The usual breakpoint shape for this is:
+
+- `breakCondition = 1`
+- `logText = ...`
+- `commandText = $breakpointcondition=0`
+- `commandCondition = ""`
+- `silent = true`
+
+Do not set `breakCondition = 0` for this pattern. If the break condition does
+not evaluate true, x64dbg will not emit the breakpoint callback event, so the
+plugin buffer will have nothing to record.
+
+That combination means:
+
+1. the breakpoint callback still fires
+2. the event buffer still records the hit
+3. x64dbg clears the final break decision before returning to the UI loop
+4. the debuggee continues running without waiting for manual resume
+
+In practice the workflow is:
+
+1. Clear the old event buffer:
+
+```text
+/Log/Clear
+```
+
+2. Configure one or more auto-continue breakpoints.
+
+3. Let the program run at full speed while the plugin accumulates events.
+
+4. Read everything back at the end:
+
+```text
+/Log/Recent?since=0&limit=-1&tail=false
+```
+
+If you expect a long run, `limit=-1` is the safest readback form because it
+does not truncate the result to a small tail window.
 
 Optional watched expressions for breakpoint events can be configured at runtime.
 The format is newline- or semicolon-separated `label=expression` pairs.
@@ -358,11 +404,16 @@ The workflow is intentionally generic:
 watched-expression profile. It expects the relevant addresses for your target
 environment, because system DLLs are usually relocated at runtime.
 
+The bundled default `--context-items` assume an x86 stack layout for
+`TranslateMessage` / `PeekMessageW`-style entrypoints. For x64 targets, keep
+the same breakpoint workflow but replace `--context-items` with an x64-appropriate
+set of expressions.
+
 Typical usage:
 
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/init_message_capture.py \
-  --x64dbg-url http://192.168.79.132:8888/ \
+  --x64dbg-url http://<vm-ip>:8888/ \
   --translate-addr 0x76187809 \
   --peek-addr 0x761905BA \
   --dispatch-addr 0x761872C4
@@ -382,12 +433,18 @@ All three breakpoints use the same auto-continue shape:
 
 ### 2. Record the raw event stream
 
-After you manually perform the UI interaction inside the debuggee, fetch the
-full buffered event log:
+After initialization, the intended recording pattern is:
+
+1. clear the old plugin log
+2. let the target run normally with the auto-continue breakpoints in place
+3. perform the UI interaction manually
+4. fetch the full buffered event log at the end
+
+Example fetch step:
 
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/fetch_message_capture.py \
-  --x64dbg-url http://192.168.79.132:8888/ \
+  --x64dbg-url http://<vm-ip>:8888/ \
   --output-json tmp/message_capture_full.json \
   --output-breakpoints tmp/message_capture_breakpoints.json
 ```
@@ -441,7 +498,7 @@ be replayed through the bridge without opening a separate shell:
 
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
-  --x64dbg-url http://192.168.79.132:8888/ \
+  --x64dbg-url http://<vm-ip>:8888/ \
   --program "C:\Python314\python.exe" \
   --cwd "C:\work\capture_demo" \
   --args "\"replay_message_replayish.py\" \"message_capture_export.json\" --dry-run" \
@@ -512,7 +569,7 @@ invoke the host execution surface without writing ad-hoc `python -c` glue:
 
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
-  --x64dbg-url http://192.168.79.132:8888/ \
+  --x64dbg-url http://<vm-ip>:8888/ \
   --program "C:\Python314\python.exe" \
   --args=-V \
   --timeout-ms 10000
@@ -524,7 +581,7 @@ Check the remote Python interpreter version:
 
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
-  --x64dbg-url http://192.168.79.132:8888/ \
+  --x64dbg-url http://<vm-ip>:8888/ \
   --program "C:\Python314\python.exe" \
   --args=-V \
   --timeout-ms 10000
@@ -534,7 +591,7 @@ Run a short one-liner on the Windows host:
 
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
-  --x64dbg-url http://192.168.79.132:8888/ \
+  --x64dbg-url http://<vm-ip>:8888/ \
   --program "C:\Python314\python.exe" \
   --args="-c \"print('hello from host python')\"" \
   --timeout-ms 10000
@@ -544,7 +601,7 @@ Run a Python script from a working directory:
 
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
-  --x64dbg-url http://192.168.79.132:8888/ \
+  --x64dbg-url http://<vm-ip>:8888/ \
   --program "C:\Python314\python.exe" \
   --cwd "C:\work\capture_demo" \
   --args "\"replay_message_replayish.py\" \"message_capture_export.json\" --dry-run" \
@@ -555,7 +612,7 @@ Run the same script for real replay:
 
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
-  --x64dbg-url http://192.168.79.132:8888/ \
+  --x64dbg-url http://<vm-ip>:8888/ \
   --program "C:\Python314\python.exe" \
   --cwd "C:\work\capture_demo" \
   --args "\"replay_message_replayish.py\" \"message_capture_export.json\"" \
@@ -566,7 +623,7 @@ Run asynchronously and inspect later:
 
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
-  --x64dbg-url http://192.168.79.132:8888/ \
+  --x64dbg-url http://<vm-ip>:8888/ \
   --mode spawn \
   --program "C:\Python314\python.exe" \
   --cwd "C:\work\capture_demo" \
@@ -620,9 +677,9 @@ To reduce reliance on raw `ExecCommand`, this fork now exposes a software-breakp
 /Breakpoint/Set?addr=0x004C223B
 /Breakpoint/Delete?addr=0x004C223B
 /Breakpoint/SetEnabled?addr=0x004C223B&enabled=true
-/Breakpoint/SetName?addr=0x004C223B&name=writer_probe
-/Breakpoint/SetCondition?addr=0x004C223B&condition=[ebp-0x0c]==0x4D10
-/Breakpoint/SetLog?addr=0x004C223B&text=WT_19728
+/Breakpoint/SetName?addr=0x004C223B&name=trace_probe
+/Breakpoint/SetCondition?addr=0x004C223B&condition=cip==0x004C223B
+/Breakpoint/SetLog?addr=0x004C223B&text=trace_hit
 /Breakpoint/SetLogCondition?addr=0x004C223B&condition=eax==0x42
 /Breakpoint/SetCommand?addr=0x004C223B&text=pause
 /Breakpoint/SetCommandCondition?addr=0x004C223B&condition=eax==0x42
@@ -681,7 +738,7 @@ Use the async endpoints instead:
 Example:
 
 ```text
-http://192.168.79.128:8888/Debug/RunAsync
+http://<vm-ip>:8888/Debug/RunAsync
 ```
 
 Expected response:
@@ -768,7 +825,7 @@ The improved plugin has been tested in this workflow:
 - Debugger: x32dbg inside a Windows VM.
 - Target: 32-bit Windows executable.
 - Plugin: `MCPx64dbg.dp32`.
-- LAN endpoint: `http://192.168.79.128:8888/`.
+- LAN endpoint: `http://<vm-ip>:8888/`.
 
 Observed behavior:
 
@@ -799,8 +856,8 @@ Operational notes that mattered in practice:
   - If a one-off helper blindly `json.loads()` every `200 OK` body, it will mis-handle these endpoints.
 - The CLI wrapper uses positional arguments, not `key=value` pairs.
   - Correct:
-    - `x64dbgvenv/bin/python x64dbg.py RegisterGet --x64dbg-url http://192.168.79.128:8888/ eax`
-    - `x64dbgvenv/bin/python x64dbg.py DebugSetBreakpoint --x64dbg-url http://192.168.79.128:8888/ 0x004C231C`
+    - `x64dbgvenv/bin/python x64dbg.py RegisterGet --x64dbg-url http://<vm-ip>:8888/ eax`
+    - `x64dbgvenv/bin/python x64dbg.py DebugSetBreakpoint --x64dbg-url http://<vm-ip>:8888/ 0x004C231C`
   - Incorrect:
     - `... RegisterGet eax=...`
     - `... DebugSetBreakpoint addr=0x004C231C`
@@ -820,15 +877,15 @@ x64dbgvenv/bin/python x64dbg.py
 With an explicit debugger URL:
 
 ```bash
-X64DBG_URL=http://192.168.79.128:8888/ x64dbgvenv/bin/python x64dbg.py
+X64DBG_URL=http://<vm-ip>:8888/ x64dbgvenv/bin/python x64dbg.py
 ```
 
 Examples with positional tool arguments:
 
 ```bash
-x64dbgvenv/bin/python x64dbg.py RegisterGet --x64dbg-url http://192.168.79.128:8888/ eax
-x64dbgvenv/bin/python x64dbg.py MiscParseExpression --x64dbg-url http://192.168.79.128:8888/ "[ebp-0x2c]"
-x64dbgvenv/bin/python x64dbg.py GetRegisterDump --x64dbg-url http://192.168.79.128:8888/
+x64dbgvenv/bin/python x64dbg.py RegisterGet --x64dbg-url http://<vm-ip>:8888/ eax
+x64dbgvenv/bin/python x64dbg.py MiscParseExpression --x64dbg-url http://<vm-ip>:8888/ "[ebp-0x2c]"
+x64dbgvenv/bin/python x64dbg.py GetRegisterDump --x64dbg-url http://<vm-ip>:8888/
 ```
 
 For GUI targets or any target expected to keep running, prefer the async wrappers:
