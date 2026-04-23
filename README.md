@@ -261,10 +261,10 @@ Clear the buffer explicitly:
 Optional watched expressions for breakpoint events can be configured at runtime.
 The format is newline- or semicolon-separated `label=expression` pairs.
 
-Set a MusicBox15-specific context profile:
+Example x86 `MSG*` context profile:
 
 ```text
-/Log/BreakpointContext/Set?items=writerTick=[ebp-0x0c];var24=[ebp-0x24];var2c=[ebp-0x2c]
+/Log/BreakpointContext/Set?items=retaddr=[esp];msg_ptr=[esp+4];msg_hwnd=[[esp+4]];msg_message=[[esp+4]+4];msg_wparam=[[esp+4]+8];msg_lparam=[[esp+4]+0xC];msg_time=[[esp+4]+0x10];msg_x=[[[esp+4]+0x14]];msg_y=[[[esp+4]+0x14]+4]
 ```
 
 List the currently configured expressions:
@@ -290,16 +290,131 @@ Example response:
       "seq": 41,
       "tickMs": 381245,
       "kind": "breakpoint",
-      "text": "addr=0x4c223b type=normal hitCount=3531 module=musicbox15 breakCondition=[ebp-0x0c]==0x4D10&&eax==0x42"
+      "text": "addr=0x76187809 type=normal hitCount=128 module=user32 breakCondition=1 logText=MSG_Translate msg_hwnd=0x001F02A2 msg_message=0x200"
     },
     {
       "seq": 42,
       "tickMs": 381910,
       "kind": "output_debug_string",
-      "text": "WT_19728_row72 tick=4D10 eax=42 eip=004C223B"
+      "text": "example debug string captured from the target process"
     }
   ]
 }
+```
+
+## Message Capture Workflow
+
+This fork now includes a small end-to-end workflow for capturing GUI message
+traffic, exporting it into a compact action script, and replaying the result.
+All four scripts live directly in `x64dbg_tools/`:
+
+- `init_message_capture.py`
+- `fetch_message_capture.py`
+- `export_message_replayish.py`
+- `replay_message_replayish.py`
+
+The workflow is intentionally generic:
+
+1. Initialize message-loop capture breakpoints in x64dbg.
+2. Perform the target UI interaction manually.
+3. Fetch the raw plugin event log to disk.
+4. Export the raw log into a compact replay-oriented JSON/Markdown pair.
+5. Replay the exported action script locally or through `HostExec`.
+
+### 1. Initialize capture
+
+`init_message_capture.py` configures breakpoint events and a default x86 `MSG*`
+watched-expression profile. It expects the relevant addresses for your target
+environment, because system DLLs are usually relocated at runtime.
+
+Typical usage:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/init_message_capture.py \
+  --x64dbg-url http://192.168.79.132:8888/ \
+  --translate-addr 0x76187809 \
+  --peek-addr 0x761905BA \
+  --dispatch-addr 0x761872C4
+```
+
+This configures:
+
+- `MSG_Translate` as the primary structured message source
+- `MSG_PeekW` as an optional queue-side source
+- `MSG_DispatchMarker` as an optional dispatch-family marker
+
+All three breakpoints use the same auto-continue shape:
+
+- `breakCondition = 1`
+- `commandText = $breakpointcondition=0`
+- `silent = true`
+
+### 2. Record the raw event stream
+
+After you manually perform the UI interaction inside the debuggee, fetch the
+full buffered event log:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/fetch_message_capture.py \
+  --x64dbg-url http://192.168.79.132:8888/ \
+  --output-json tmp/message_capture_full.json \
+  --output-breakpoints tmp/message_capture_breakpoints.json
+```
+
+By default this uses `limit=-1`, `since=0`, and forward pagination semantics,
+so it retrieves the entire currently buffered log in one shot.
+
+### 3. Export a compact replay-oriented script
+
+Turn the raw `/Log/Recent` JSON into:
+
+- a filtered event list
+- a compressed `actions` list
+- a Markdown summary
+
+```text
+python3 x64dbg_tools/export_message_replayish.py \
+  tmp/message_capture_full.json \
+  --output-prefix tmp/message_capture_export
+```
+
+The exporter keeps a small default message set:
+
+- `WM_MOUSEMOVE`
+- `WM_LBUTTONDOWN`
+- `WM_LBUTTONUP`
+- `WM_NCMOUSEMOVE`
+
+It also compresses contiguous move runs into `move_segment` actions and removes
+pure zero-displacement separators.
+
+### 4. Replay the exported actions
+
+Replay the exported `actions` list either in dry-run mode or for real:
+
+```text
+python3 x64dbg_tools/replay_message_replayish.py \
+  tmp/message_capture_export.json \
+  --dry-run
+```
+
+Live replay is currently Windows-only and uses high-level pointer primitives:
+
+- `SetCursorPos`
+- `mouse_event(MOUSEEVENTF_LEFTDOWN/LEFTUP)`
+
+### 5. Replay remotely through HostExec
+
+If the plugin is running on a Windows VM, the same exported action script can
+be replayed through the bridge without opening a separate shell:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
+  --x64dbg-url http://192.168.79.132:8888/ \
+  --program "C:\Python314\python.exe" \
+  --cwd "C:\work\capture_demo" \
+  --args "\"replay_message_replayish.py\" \"message_capture_export.json\" --dry-run" \
+  --timeout-ms 20000
 ```
 
 ## Host Process Execution
@@ -320,6 +435,13 @@ Common parameters:
 - `program`: executable path on the Windows host
 - `args`: raw command-line argument tail appended after the quoted program
 - `cwd`: optional working directory
+
+Client timeout behavior:
+
+- `HostExec` waits on the plugin side for up to `timeoutMs`.
+- The Python wrapper in `x64dbg_tools/x64dbg.py` now automatically keeps its
+  HTTP read timeout longer than `timeoutMs`, so long-running successful jobs do
+  not spuriously fail with a client-side read timeout first.
 
 Start asynchronously:
 
@@ -352,11 +474,79 @@ Notes:
 - stdout and stderr are currently merged into the returned `output` field.
 - This is intentionally a host-process interface, not a shell interface.
 
+### Helper CLI
+
+For bridge-driven usage, `x64dbg_tools/hostexec_call.py` is the easiest way to
+invoke the host execution surface without writing ad-hoc `python -c` glue:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
+  --x64dbg-url http://192.168.79.132:8888/ \
+  --program "C:\Python314\python.exe" \
+  --args=-V \
+  --timeout-ms 10000
+```
+
+### Remote Python Examples
+
+Check the remote Python interpreter version:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
+  --x64dbg-url http://192.168.79.132:8888/ \
+  --program "C:\Python314\python.exe" \
+  --args=-V \
+  --timeout-ms 10000
+```
+
+Run a short one-liner on the Windows host:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
+  --x64dbg-url http://192.168.79.132:8888/ \
+  --program "C:\Python314\python.exe" \
+  --args="-c \"print('hello from host python')\"" \
+  --timeout-ms 10000
+```
+
+Run a Python script from a working directory:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
+  --x64dbg-url http://192.168.79.132:8888/ \
+  --program "C:\Python314\python.exe" \
+  --cwd "C:\work\capture_demo" \
+  --args "\"replay_message_replayish.py\" \"message_capture_export.json\" --dry-run" \
+  --timeout-ms 20000
+```
+
+Run the same script for real replay:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
+  --x64dbg-url http://192.168.79.132:8888/ \
+  --program "C:\Python314\python.exe" \
+  --cwd "C:\work\capture_demo" \
+  --args "\"replay_message_replayish.py\" \"message_capture_export.json\"" \
+  --timeout-ms 30000
+```
+
+Run asynchronously and inspect later:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
+  --x64dbg-url http://192.168.79.132:8888/ \
+  --mode spawn \
+  --program "C:\Python314\python.exe" \
+  --cwd "C:\work\capture_demo" \
+  --args "\"replay_message_replayish.py\" \"message_capture_export.json\""
+```
+
 ## Legacy Breakpoint Action Caveats
 
 This fork still exposes the older breakpoint-management surface through x64dbg commands and `/Breakpoint/List`, but real-world tracing showed that the legacy GUI breakpoint action workflow is not a reliable source of truth for remote automation.
 
-Observed problems during MusicBox15 reverse-engineering:
+Observed problems during real-world reverse-engineering and GUI automation work:
 
 - `Breakpoint/List` only reports the configured breakpoint fields such as `breakCondition`, `logText`, and `commandText`. It does not prove that x64dbg actually evaluated those fields the way the GUI suggests at runtime.
 - `Breakpoint/List` now also returns `logCondition` and `commandCondition`, which helps explain GUI states where those condition fields remain populated even after the corresponding command or log text has been cleared.
