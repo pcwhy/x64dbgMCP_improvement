@@ -271,6 +271,113 @@ def ClearLog() -> dict:
 
 
 @mcp.tool()
+def HostSpawn(program: str, args: str = "", cwd: str = "") -> dict:
+    """
+    Spawn a Windows host process through the x64dbg plugin without going through cmd.exe.
+
+    Parameters:
+        program: Executable path to launch on the Windows host
+        args: Raw command-line argument tail appended after the quoted program
+        cwd: Optional working directory
+
+    Returns:
+        Dictionary with:
+        - success
+        - job: Host job metadata and current status
+    """
+    result = safe_get(
+        "Host/Spawn",
+        {
+            "program": program,
+            "args": args,
+            "cwd": cwd,
+        },
+    )
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def HostExec(program: str, args: str = "", cwd: str = "", timeout_ms: int = 30000) -> dict:
+    """
+    Execute a Windows host process through the x64dbg plugin and wait up to timeout_ms.
+
+    Parameters:
+        program: Executable path to launch on the Windows host
+        args: Raw command-line argument tail appended after the quoted program
+        cwd: Optional working directory
+        timeout_ms: Maximum synchronous wait time before returning the still-running job
+
+    Returns:
+        Dictionary with:
+        - success
+        - timedOut
+        - job: Host job metadata and current status
+    """
+    result = safe_get(
+        "Host/Exec",
+        {
+            "program": program,
+            "args": args,
+            "cwd": cwd,
+            "timeoutMs": timeout_ms,
+        },
+    )
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def HostJobGet(job_id: int) -> dict:
+    """
+    Read the current status of a Windows host job started by HostSpawn/HostExec.
+
+    Parameters:
+        job_id: Host job id
+    """
+    result = safe_get("Host/Job/Get", {"id": job_id})
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def HostJobKill(job_id: int) -> dict:
+    """
+    Terminate a running Windows host job started by HostSpawn/HostExec.
+
+    Parameters:
+        job_id: Host job id
+    """
+    result = safe_get("Host/Job/Kill", {"id": job_id})
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
 def GetBreakpointContextExpressions() -> dict:
     """
     List the extra expressions currently appended to plugin breakpoint events.

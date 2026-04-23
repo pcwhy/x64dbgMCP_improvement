@@ -35,6 +35,7 @@
 #include <cstring>
 #include <deque>
 #include <optional>
+#include <memory>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -84,6 +85,30 @@ struct BreakpointContextExpression {
 };
 
 std::vector<BreakpointContextExpression> g_breakpointContextExpressions;
+std::mutex g_hostExecMutex;
+
+struct HostExecJob {
+    unsigned long long id = 0;
+    std::string program;
+    std::string args;
+    std::string cwd;
+    std::string commandLine;
+    unsigned long long createdTickMs = 0;
+    unsigned long long startedTickMs = 0;
+    unsigned long long finishedTickMs = 0;
+    DWORD processId = 0;
+    DWORD exitCode = STILL_ACTIVE;
+    HANDLE processHandle = NULL;
+    bool launchSuccess = false;
+    bool running = false;
+    bool finished = false;
+    bool killRequested = false;
+    std::string output;
+    std::string error;
+};
+
+std::unordered_map<unsigned long long, std::shared_ptr<HostExecJob>> g_hostExecJobs;
+unsigned long long g_hostExecNextJobId = 0;
 
 enum class DebugAction {
     Run,
@@ -137,6 +162,13 @@ std::string trimForLog(const std::string& text);
 void clearEventLog();
 size_t eventLogSize();
 std::string readOutputDebugString(const OUTPUT_DEBUG_STRING_INFO* info);
+std::wstring utf8ToWide(const std::string& text);
+std::string win32ErrorMessage(DWORD error);
+std::string buildProcessCommandLine(const std::string& program, const std::string& args);
+std::shared_ptr<HostExecJob> createHostExecJob(const std::string& program, const std::string& args, const std::string& cwd, std::string& error);
+std::shared_ptr<HostExecJob> getHostExecJob(unsigned long long jobId);
+void appendHostExecJobJson(std::ostream& ss, const HostExecJob& job);
+DWORD WINAPI HostExecJobThread(LPVOID lpParam);
 void cbBreakpointEvent(CBTYPE bType, void* callbackInfo);
 void cbOutputDebugStringEvent(CBTYPE bType, void* callbackInfo);
 
@@ -544,6 +576,228 @@ std::string readOutputDebugString(const OUTPUT_DEBUG_STRING_INFO* info) {
     }
     buffer[sizeRead] = '\0';
     return std::string(buffer.data());
+}
+
+std::wstring utf8ToWide(const std::string& text) {
+    if (text.empty()) {
+        return std::wstring();
+    }
+    int wideLen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, NULL, 0);
+    if (wideLen <= 0) {
+        wideLen = MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, NULL, 0);
+        if (wideLen <= 0) {
+            return std::wstring(text.begin(), text.end());
+        }
+        std::wstring wide(static_cast<size_t>(wideLen), L'\0');
+        MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, &wide[0], wideLen);
+        if (!wide.empty() && wide.back() == L'\0') {
+            wide.pop_back();
+        }
+        return wide;
+    }
+    std::wstring wide(static_cast<size_t>(wideLen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, &wide[0], wideLen);
+    if (!wide.empty() && wide.back() == L'\0') {
+        wide.pop_back();
+    }
+    return wide;
+}
+
+std::string win32ErrorMessage(DWORD error) {
+    LPSTR buffer = NULL;
+    DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+    DWORD len = FormatMessageA(flags, NULL, error, 0, (LPSTR)&buffer, 0, NULL);
+    std::string message;
+    if (len != 0 && buffer != NULL) {
+        message.assign(buffer, len);
+        LocalFree(buffer);
+    } else {
+        message = "Unknown error";
+    }
+    trimParam(message);
+    std::ostringstream ss;
+    ss << message << " (code=" << error << ")";
+    return ss.str();
+}
+
+std::string buildProcessCommandLine(const std::string& program, const std::string& args) {
+    std::string commandLine = quoteCommandArgument(program);
+    if (!args.empty()) {
+        commandLine.push_back(' ');
+        commandLine += args;
+    }
+    return commandLine;
+}
+
+std::shared_ptr<HostExecJob> createHostExecJob(const std::string& program, const std::string& args, const std::string& cwd, std::string& error) {
+    std::string trimmedProgram = program;
+    std::string trimmedArgs = args;
+    std::string trimmedCwd = cwd;
+    trimParam(trimmedProgram);
+    trimParam(trimmedArgs);
+    trimParam(trimmedCwd);
+    if (trimmedProgram.empty()) {
+        error = "Missing program";
+        return nullptr;
+    }
+
+    auto job = std::make_shared<HostExecJob>();
+    {
+        std::lock_guard<std::mutex> lock(g_hostExecMutex);
+        job->id = ++g_hostExecNextJobId;
+        job->program = trimmedProgram;
+        job->args = trimmedArgs;
+        job->cwd = trimmedCwd;
+        job->commandLine = buildProcessCommandLine(trimmedProgram, trimmedArgs);
+        job->createdTickMs = GetTickCount64();
+        g_hostExecJobs[job->id] = job;
+    }
+
+    auto* threadArg = new std::shared_ptr<HostExecJob>(job);
+    HANDLE thread = CreateThread(NULL, 0, HostExecJobThread, threadArg, 0, NULL);
+    if (thread == NULL) {
+        error = "CreateThread failed: " + win32ErrorMessage(GetLastError());
+        {
+            std::lock_guard<std::mutex> lock(g_hostExecMutex);
+            g_hostExecJobs.erase(job->id);
+        }
+        delete threadArg;
+        return nullptr;
+    }
+    CloseHandle(thread);
+    return job;
+}
+
+std::shared_ptr<HostExecJob> getHostExecJob(unsigned long long jobId) {
+    std::lock_guard<std::mutex> lock(g_hostExecMutex);
+    auto it = g_hostExecJobs.find(jobId);
+    if (it == g_hostExecJobs.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+void appendHostExecJobJson(std::ostream& ss, const HostExecJob& job) {
+    ss << "{"
+       << "\"id\":" << job.id << ","
+       << "\"program\":\"" << escapeJsonString(job.program.c_str()) << "\","
+       << "\"args\":\"" << escapeJsonString(job.args.c_str()) << "\","
+       << "\"cwd\":\"" << escapeJsonString(job.cwd.c_str()) << "\","
+       << "\"commandLine\":\"" << escapeJsonString(job.commandLine.c_str()) << "\","
+       << "\"createdTickMs\":" << job.createdTickMs << ","
+       << "\"startedTickMs\":" << job.startedTickMs << ","
+       << "\"finishedTickMs\":" << job.finishedTickMs << ","
+       << "\"processId\":" << job.processId << ","
+       << "\"exitCode\":" << static_cast<unsigned long long>(job.exitCode) << ","
+       << "\"launchSuccess\":" << (job.launchSuccess ? "true" : "false") << ","
+       << "\"running\":" << (job.running ? "true" : "false") << ","
+       << "\"finished\":" << (job.finished ? "true" : "false") << ","
+       << "\"killRequested\":" << (job.killRequested ? "true" : "false") << ","
+       << "\"output\":\"" << escapeJsonString(job.output.c_str()) << "\","
+       << "\"error\":\"" << escapeJsonString(job.error.c_str()) << "\""
+       << "}";
+}
+
+DWORD WINAPI HostExecJobThread(LPVOID lpParam) {
+    std::unique_ptr<std::shared_ptr<HostExecJob>> holder(static_cast<std::shared_ptr<HostExecJob>*>(lpParam));
+    std::shared_ptr<HostExecJob> job = *holder;
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+
+    HANDLE readPipe = NULL;
+    HANDLE writePipe = NULL;
+    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) {
+        std::lock_guard<std::mutex> lock(g_hostExecMutex);
+        job->finished = true;
+        job->error = "CreatePipe failed: " + win32ErrorMessage(GetLastError());
+        job->finishedTickMs = GetTickCount64();
+        return 1;
+    }
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = writePipe;
+    si.hStdError = writePipe;
+
+    std::wstring wideProgram = utf8ToWide(job->program);
+    std::wstring wideCommandLine = utf8ToWide(job->commandLine);
+    std::wstring wideCwd = utf8ToWide(job->cwd);
+    std::vector<wchar_t> mutableCommandLine(wideCommandLine.begin(), wideCommandLine.end());
+    mutableCommandLine.push_back(L'\0');
+
+    BOOL created = CreateProcessW(
+        wideProgram.empty() ? NULL : wideProgram.c_str(),
+        mutableCommandLine.data(),
+        NULL,
+        NULL,
+        TRUE,
+        CREATE_NO_WINDOW,
+        NULL,
+        wideCwd.empty() ? NULL : wideCwd.c_str(),
+        &si,
+        &pi
+    );
+
+    CloseHandle(writePipe);
+    writePipe = NULL;
+
+    if (!created) {
+        std::lock_guard<std::mutex> lock(g_hostExecMutex);
+        job->finished = true;
+        job->error = "CreateProcessW failed: " + win32ErrorMessage(GetLastError());
+        job->finishedTickMs = GetTickCount64();
+        if (readPipe != NULL) {
+            CloseHandle(readPipe);
+        }
+        return 1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_hostExecMutex);
+        job->launchSuccess = true;
+        job->running = true;
+        job->startedTickMs = GetTickCount64();
+        job->processId = pi.dwProcessId;
+        job->processHandle = pi.hProcess;
+    }
+
+    CloseHandle(pi.hThread);
+
+    char buffer[4096];
+    DWORD bytesRead = 0;
+    std::string capturedOutput;
+    while (ReadFile(readPipe, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0) {
+        capturedOutput.append(buffer, buffer + bytesRead);
+    }
+    CloseHandle(readPipe);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    {
+        std::lock_guard<std::mutex> lock(g_hostExecMutex);
+        job->output = capturedOutput;
+        job->exitCode = exitCode;
+        job->running = false;
+        job->finished = true;
+        job->finishedTickMs = GetTickCount64();
+        if (job->processHandle != NULL) {
+            CloseHandle(job->processHandle);
+            job->processHandle = NULL;
+        }
+    }
+
+    return 0;
 }
 
 void cbBreakpointEvent(CBTYPE bType, void* callbackInfo) {
@@ -1024,6 +1278,153 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     ss << "\"cleared\":" << oldExpressions.size();
                     ss << "}";
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Host/Spawn" || path == "/host/spawn") {
+                    std::string program = urlDecode(queryParams["program"]);
+                    std::string args = urlDecode(queryParams["args"]);
+                    std::string cwd = urlDecode(queryParams["cwd"]);
+                    std::string error;
+                    std::shared_ptr<HostExecJob> job = createHostExecJob(program, args, cwd, error);
+                    if (!job) {
+                        std::ostringstream ss;
+                        ss << "{"
+                           << "\"success\":false,"
+                           << "\"error\":\"" << escapeJsonString(error.c_str()) << "\""
+                           << "}";
+                        sendHttpResponse(clientSocket, 400, "application/json", ss.str());
+                        continue;
+                    }
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"success\":true,"
+                       << "\"job\":";
+                    appendHostExecJobJson(ss, *job);
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Host/Exec" || path == "/host/exec") {
+                    std::string program = urlDecode(queryParams["program"]);
+                    std::string args = urlDecode(queryParams["args"]);
+                    std::string cwd = urlDecode(queryParams["cwd"]);
+                    int timeoutMs = 30000;
+                    if (!queryParams["timeoutMs"].empty()) {
+                        try { timeoutMs = std::stoi(queryParams["timeoutMs"]); } catch (...) {}
+                        if (timeoutMs < 0) timeoutMs = 0;
+                    }
+                    std::string error;
+                    std::shared_ptr<HostExecJob> job = createHostExecJob(program, args, cwd, error);
+                    if (!job) {
+                        std::ostringstream ss;
+                        ss << "{"
+                           << "\"success\":false,"
+                           << "\"error\":\"" << escapeJsonString(error.c_str()) << "\""
+                           << "}";
+                        sendHttpResponse(clientSocket, 400, "application/json", ss.str());
+                        continue;
+                    }
+
+                    const unsigned long long startWait = GetTickCount64();
+                    bool timedOut = false;
+                    while (true) {
+                        std::shared_ptr<HostExecJob> current = getHostExecJob(job->id);
+                        if (!current) {
+                            break;
+                        }
+                        bool finished = false;
+                        {
+                            std::lock_guard<std::mutex> lock(g_hostExecMutex);
+                            finished = current->finished;
+                        }
+                        if (finished) {
+                            job = current;
+                            break;
+                        }
+                        if (GetTickCount64() - startWait >= static_cast<unsigned long long>(timeoutMs)) {
+                            timedOut = true;
+                            job = current;
+                            break;
+                        }
+                        Sleep(25);
+                    }
+
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"success\":true,"
+                       << "\"timedOut\":" << (timedOut ? "true" : "false") << ","
+                       << "\"job\":";
+                    appendHostExecJobJson(ss, *job);
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Host/Job/Get" || path == "/host/job/get") {
+                    std::string idStr = queryParams["id"];
+                    if (idStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'id' parameter\"}");
+                        continue;
+                    }
+                    unsigned long long jobId = 0;
+                    try {
+                        jobId = std::stoull(idStr);
+                    } catch (...) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Invalid job id\"}");
+                        continue;
+                    }
+                    std::shared_ptr<HostExecJob> job = getHostExecJob(jobId);
+                    if (!job) {
+                        sendHttpResponse(clientSocket, 404, "application/json",
+                            "{\"error\":\"Host job not found\"}");
+                        continue;
+                    }
+                    std::ostringstream ss;
+                    appendHostExecJobJson(ss, *job);
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/Host/Job/Kill" || path == "/host/job/kill") {
+                    std::string idStr = queryParams["id"];
+                    if (idStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'id' parameter\"}");
+                        continue;
+                    }
+                    unsigned long long jobId = 0;
+                    try {
+                        jobId = std::stoull(idStr);
+                    } catch (...) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Invalid job id\"}");
+                        continue;
+                    }
+                    std::shared_ptr<HostExecJob> job = getHostExecJob(jobId);
+                    if (!job) {
+                        sendHttpResponse(clientSocket, 404, "application/json",
+                            "{\"error\":\"Host job not found\"}");
+                        continue;
+                    }
+
+                    bool killOk = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_hostExecMutex);
+                        if (job->processHandle != NULL && job->running) {
+                            killOk = TerminateProcess(job->processHandle, 1) == TRUE;
+                            if (killOk) {
+                                job->killRequested = true;
+                            } else {
+                                job->error = "TerminateProcess failed: " + win32ErrorMessage(GetLastError());
+                            }
+                        } else {
+                            job->killRequested = true;
+                        }
+                    }
+
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"success\":" << (killOk ? "true" : "false") << ","
+                       << "\"job\":";
+                    appendHostExecJobJson(ss, *job);
+                    ss << "}";
+                    sendHttpResponse(clientSocket, killOk ? 200 : 409, "application/json", ss.str());
                 }
                 else if (path == "/ExecCommand") {
                     std::string cmd = queryParams["cmd"];
