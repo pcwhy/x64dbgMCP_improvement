@@ -64,6 +64,14 @@ This fork addresses those two issues while preserving the original command style
   - raw event-log fetch
   - replay-oriented export
   - high-level replay of exported pointer/click action scripts
+- Added a generic end-to-end message-capture workflow in `x64dbg_tools/`:
+  - initialize capture breakpoints
+  - fetch raw buffered events
+  - export compressed replay-oriented actions
+  - replay the exported actions locally or remotely
+- Added bidirectional file-transfer helpers on top of `HostExec` and remote Python:
+  - `push_file_via_hostexec.py` uploads local files to a Windows VM path in verified chunks
+  - `pull_file_via_hostexec.py` downloads remote files back in verified chunks
 - Added a socket receive timeout to avoid stalled client connections blocking the HTTP thread.
 - Disabled the old synchronous `/Disasm/StepInWithDisasm` endpoint because it performed a direct step inside the HTTP request handler.
 - Fixed HTTP server start/stop state handling to avoid a potential self-lock/restart issue.
@@ -400,6 +408,50 @@ The workflow is intentionally generic:
 4. Export the raw log into a compact replay-oriented JSON/Markdown pair.
 5. Replay the exported action script locally or through `HostExec`.
 
+### 0. Find useful message-loop probe points
+
+Do not hardcode message-loop addresses across runs. System DLLs are relocated,
+and not every candidate API gives equally useful data.
+
+The practical way to discover good probe points is:
+
+1. Resolve the current addresses of message-loop candidates in the debugger for
+   the current run.
+   Good starting candidates are:
+   - `TranslateMessage`
+   - `PeekMessageW` / `PeekMessageA`
+   - `GetMessageW` / `GetMessageA`
+   - `DispatchMessageW` / `DispatchMessageA`
+2. Attach temporary auto-continue breakpoints to those candidate entrypoints.
+3. Configure a small watched-expression profile that tries to decode the
+   candidate's key arguments, for example an x86 `MSG*` shape.
+4. Perform one short UI gesture, such as a single click or a small mouse move.
+5. Fetch the buffered events and compare the decoded output quality.
+
+What usually makes a breakpoint "useful":
+
+- the decoded pointer looks valid instead of `0`, `0xFEEEFEEE`, or code bytes
+- `msg_message` values look like real Windows message ids
+- `hwnd`, `x`, and `y` are plausible for the UI action you just performed
+- the same breakpoint produces a stable shape over many hits
+
+What usually makes a breakpoint "not useful":
+
+- it decodes to garbage-looking fields
+- the argument shape changes across callers
+- it mostly reports internal framework churn rather than user-visible actions
+
+In practice:
+
+- `TranslateMessage` is often the best structured source for replay-oriented
+  capture.
+- `PeekMessageW` is often useful as a queue-side companion.
+- `GetMessageW` matters mainly for programs that actually block on `GetMessage`
+  rather than pumping with `PeekMessage`.
+- `DispatchMessageW` should not be assumed to expose a single stable `MSG*`
+  layout; verify it per caller family before trusting it as a structured source.
+  If it does not decode cleanly, keep it only as a dispatch marker.
+
 ### 1. Initialize capture
 
 `init_message_capture.py` configures breakpoint events and a default x86 `MSG*`
@@ -432,6 +484,12 @@ All three breakpoints use the same auto-continue shape:
 - `breakCondition = 1`
 - `commandText = $breakpointcondition=0`
 - `silent = true`
+
+The helper intentionally configures these breakpoints one-by-one, waits briefly
+after each mutation, and then polls the final breakpoint object until the
+expected state is visible. In practice this is more reliable than trying to
+blast several message-loop breakpoints into x64dbg at once and only checking
+state afterward.
 
 ### 2. Record the raw event stream
 
