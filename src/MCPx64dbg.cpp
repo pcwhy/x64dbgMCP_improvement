@@ -129,7 +129,7 @@ bool getBreakpointByAddress(duint addr, BRIDGEBP& outBp);
 std::string formatBreakpointAddress(duint addr);
 std::string quoteCommandArgument(const std::string& value);
 std::string buildBreakpointCommand(const std::string& commandName, const std::string& addrText, const std::optional<std::string>& value, bool quoteValue);
-void appendBreakpointJson(std::ostringstream& ss, const BRIDGEBP& bp, const char* forcedType = nullptr);
+void appendBreakpointJson(std::ostream& ss, const BRIDGEBP& bp, const char* forcedType = nullptr);
 bool applyBreakpointCommandSequence(duint addr, const std::vector<std::string>& commands, std::string& attemptsSummary, BRIDGEBP& finalBp);
 bool applyBreakpointSilentFlag(duint addr, bool silent, std::string& attemptsSummary, bool& finalSilent);
 void appendEventLog(const std::string& kind, const std::string& text);
@@ -367,7 +367,7 @@ std::string buildBreakpointCommand(const std::string& commandName, const std::st
     return commandName + " " + addrText + "," + *value;
 }
 
-void appendBreakpointJson(std::ostringstream& ss, const BRIDGEBP& bp, const char* forcedType) {
+void appendBreakpointJson(std::ostream& ss, const BRIDGEBP& bp, const char* forcedType) {
     const char* bpTypeStr = forcedType ? forcedType : "unknown";
     if (!forcedType) {
         switch (bp.type) {
