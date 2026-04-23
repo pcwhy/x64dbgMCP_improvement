@@ -1,4 +1,4 @@
-# x64dbgMCP++
+# x64dbgMCP Improved
 
 This repository contains a patched and extended build of the x64dbg MCP/HTTP plugin used for remote-assisted x32dbg/x64dbg debugging.
 
@@ -389,6 +389,8 @@ All four scripts live directly in `x64dbg_tools/`:
 - `fetch_message_capture.py`
 - `export_message_replayish.py`
 - `replay_message_replayish.py`
+- `push_file_via_hostexec.py`
+- `pull_file_via_hostexec.py`
 
 The workflow is intentionally generic:
 
@@ -505,6 +507,46 @@ rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
   --timeout-ms 20000
 ```
 
+### 6. Push supporting files to the VM first
+
+If the replay script or exported JSON are not already present on the Windows
+side, `push_file_via_hostexec.py` can upload them through the same bridge by
+splitting the local file into base64 chunks and letting remote Python rebuild
+the destination file.
+
+Push the replay script:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/push_file_via_hostexec.py \
+  --x64dbg-url http://<vm-ip>:8888/ \
+  --remote-python "C:\Python314\python.exe" \
+  x64dbg_tools/replay_message_replayish.py \
+  "C:\work\capture_demo\replay_message_replayish.py"
+```
+
+Push the exported action JSON:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/push_file_via_hostexec.py \
+  --x64dbg-url http://<vm-ip>:8888/ \
+  --remote-python "C:\Python314\python.exe" \
+  tmp/message_capture_export.json \
+  "C:\work\capture_demo\message_capture_export.json"
+```
+
+By default the helper verifies the remote file size and SHA-256 hash after the
+last chunk is written.
+
+Pull a generated file or log back from the VM:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/pull_file_via_hostexec.py \
+  --x64dbg-url http://<vm-ip>:8888/ \
+  --remote-python "C:\Python314\python.exe" \
+  "C:\work\capture_demo\message_capture_export.json" \
+  tmp/message_capture_export.from_vm.json
+```
+
 ## Host Process Execution
 
 The plugin can now launch a Windows host-side process without going through
@@ -561,6 +603,12 @@ Notes:
   individual argument that contains spaces.
 - stdout and stderr are currently merged into the returned `output` field.
 - This is intentionally a host-process interface, not a shell interface.
+- For larger artifacts such as scripts, JSON captures, or helper binaries,
+  prefer `push_file_via_hostexec.py` instead of trying to inline the whole file
+  content into a single command string.
+- If the remote side generates files that you want to keep locally, prefer
+  `pull_file_via_hostexec.py` instead of trying to print an entire file through
+  one ad-hoc `python -c` command.
 
 ### Helper CLI
 
@@ -574,6 +622,67 @@ rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
   --args=-V \
   --timeout-ms 10000
 ```
+
+### Remote File Upload Helper
+
+`x64dbg_tools/push_file_via_hostexec.py` uses the existing `HostExec` API plus
+remote Python to rebuild a file on the Windows side without manual copy/paste
+or shared folders.
+
+It works by:
+
+1. reading the local source file
+2. splitting it into chunks
+3. base64-encoding each chunk
+4. calling remote Python once per chunk to append it to the destination file
+5. verifying remote size and SHA-256 by default
+
+Typical usage:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/push_file_via_hostexec.py \
+  --x64dbg-url http://<vm-ip>:8888/ \
+  --remote-python "C:\Python314\python.exe" \
+  local_file.bin \
+  "C:\work\remote_file.bin"
+```
+
+Useful options:
+
+- `--cwd`: remote working directory for each host-exec call
+- `--chunk-size`: raw bytes per upload chunk
+- `--timeout-ms`: per-chunk host-exec timeout
+- `--no-verify`: skip remote size/hash verification
+
+### Remote File Download Helper
+
+`x64dbg_tools/pull_file_via_hostexec.py` is the inverse helper. It asks remote
+Python for file metadata first, then reads the target file back in chunks and
+reassembles it locally.
+
+It works by:
+
+1. calling remote Python to query `exists`, `size`, and `sha256`
+2. reading the remote file back chunk-by-chunk as base64
+3. rebuilding the file locally
+4. comparing the rebuilt local size/hash against the remote metadata by default
+
+Typical usage:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/pull_file_via_hostexec.py \
+  --x64dbg-url http://<vm-ip>:8888/ \
+  --remote-python "C:\Python314\python.exe" \
+  "C:\work\remote_file.bin" \
+  local_copy.bin
+```
+
+Useful options:
+
+- `--cwd`: remote working directory for each host-exec call
+- `--chunk-size`: raw bytes per download chunk
+- `--timeout-ms`: per-chunk host-exec timeout
+- `--no-verify`: skip final local-vs-remote size/hash verification
 
 ### Remote Python Examples
 
