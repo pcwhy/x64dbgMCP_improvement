@@ -890,39 +890,68 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     int limit = 100;
                     unsigned long long since = 0;
                     bool clearAfter = false;
+                    bool tail = true;
+                    bool unlimited = false;
 
                     if (!queryParams["limit"].empty()) {
                         try { limit = std::stoi(queryParams["limit"]); } catch (...) {}
-                        if (limit < 1) limit = 1;
-                        if (limit > 2000) limit = 2000;
+                        if (limit == -1) {
+                            unlimited = true;
+                        } else {
+                            if (limit < 1) limit = 1;
+                            if (limit > 2000) limit = 2000;
+                        }
                     }
                     if (!queryParams["since"].empty()) {
                         try { since = std::stoull(queryParams["since"]); } catch (...) {}
+                    }
+                    std::string tailStr = queryParams["tail"];
+                    std::transform(tailStr.begin(), tailStr.end(), tailStr.begin(), ::tolower);
+                    if (!tailStr.empty()) {
+                        tail = !(tailStr == "0" || tailStr == "false" || tailStr == "no");
                     }
                     std::string clearStr = queryParams["clear"];
                     std::transform(clearStr.begin(), clearStr.end(), clearStr.begin(), ::tolower);
                     clearAfter = (clearStr == "1" || clearStr == "true" || clearStr == "yes");
 
-                    std::vector<EventLogEntry> entries;
+                    std::vector<EventLogEntry> matchingEntries;
                     {
                         std::lock_guard<std::mutex> lock(g_eventLogMutex);
                         for (const auto& entry : g_eventLog) {
                             if (entry.seq > since) {
-                                entries.push_back(entry);
+                                matchingEntries.push_back(entry);
                             }
-                        }
-                        if (entries.size() > static_cast<size_t>(limit)) {
-                            entries.erase(entries.begin(), entries.end() - limit);
                         }
                         if (clearAfter) {
                             g_eventLog.clear();
                         }
                     }
 
+                    const size_t matchedCount = matchingEntries.size();
+                    std::vector<EventLogEntry> entries = matchingEntries;
+                    if (!unlimited && entries.size() > static_cast<size_t>(limit)) {
+                        if (tail) {
+                            entries.erase(entries.begin(), entries.end() - limit);
+                        } else {
+                            entries.resize(static_cast<size_t>(limit));
+                        }
+                    }
+
+                    unsigned long long nextSince = since;
+                    if (!entries.empty()) {
+                        nextSince = entries.back().seq;
+                    }
+                    const bool hasMore = entries.size() < matchedCount;
+
                     std::stringstream ss;
                     ss << "{";
                     ss << "\"count\":" << entries.size() << ",";
+                    ss << "\"matchedCount\":" << matchedCount << ",";
                     ss << "\"totalBuffered\":" << eventLogSize() << ",";
+                    ss << "\"hasMore\":" << (hasMore ? "true" : "false") << ",";
+                    ss << "\"nextSince\":" << nextSince << ",";
+                    ss << "\"tail\":" << (tail ? "true" : "false") << ",";
+                    ss << "\"unlimited\":" << (unlimited ? "true" : "false") << ",";
                     ss << "\"entries\":[";
                     for (size_t i = 0; i < entries.size(); i++) {
                         if (i > 0) ss << ",";

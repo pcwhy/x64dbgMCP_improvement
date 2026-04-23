@@ -203,7 +203,7 @@ def ExecCommand(cmd: str, offset: int = 0, limit: int = 100) -> dict:
 
 
 @mcp.tool()
-def GetRecentLog(limit: int = 100, since: int = 0, clear: bool = False) -> dict:
+def GetRecentLog(limit: int = 100, since: int = 0, clear: bool = False, tail: bool = True) -> dict:
     """
     Read recent plugin-captured debugger events.
 
@@ -212,17 +212,33 @@ def GetRecentLog(limit: int = 100, since: int = 0, clear: bool = False) -> dict:
     include plugin-captured breakpoint hits and debug-string events.
 
     Parameters:
-        limit: Maximum number of recent entries to return (default: 100, max: 2000)
+        limit: Maximum number of entries to return. Use -1 to return every
+            buffered entry that matches `since`.
         since: Only return entries with seq greater than this value (default: 0)
         clear: Clear the buffer after reading (default: False)
+        tail: If True (default), return the newest matching entries when the
+            result set is larger than `limit`. If False, return the earliest
+            matching entries after `since`, which is better for forward paging.
 
     Returns:
         Dictionary with:
         - count: Number of returned entries
+        - matchedCount: Number of buffered entries matching the `since` filter
         - totalBuffered: Current number of entries still buffered
+        - hasMore: Whether additional matching entries were not returned
+        - nextSince: Sequence number to use as the next `since` value for
+          forward paging
         - entries: List of event objects with seq, tickMs, kind, and text
     """
-    result = safe_get("Log/Recent", {"limit": limit, "since": since, "clear": str(clear).lower()})
+    result = safe_get(
+        "Log/Recent",
+        {
+            "limit": limit,
+            "since": since,
+            "clear": str(clear).lower(),
+            "tail": str(tail).lower(),
+        },
+    )
     if isinstance(result, dict):
         return result
     if isinstance(result, str):
