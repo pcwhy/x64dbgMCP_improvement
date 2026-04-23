@@ -224,6 +224,18 @@ Read entries newer than a prior sequence id:
 /Log/Recent?since=250&limit=50
 ```
 
+Read entries newer than a prior sequence id in forward-pagination order:
+
+```text
+/Log/Recent?since=250&limit=50&tail=false
+```
+
+Read every buffered entry newer than a prior sequence id:
+
+```text
+/Log/Recent?since=250&limit=-1
+```
+
 Read and clear in one request:
 
 ```text
@@ -235,6 +247,16 @@ Clear the buffer explicitly:
 ```text
 /Log/Clear
 ```
+
+`/Log/Recent` returns pagination metadata:
+
+- `count`: number of returned entries
+- `matchedCount`: number of buffered entries matching the `since` filter
+- `totalBuffered`: current event-buffer size
+- `hasMore`: whether more matching entries exist beyond the returned page
+- `nextSince`: sequence id to reuse as the next `since` value
+- `tail`: whether the request used newest-first truncation
+- `unlimited`: whether `limit=-1` was used
 
 Optional watched expressions for breakpoint events can be configured at runtime.
 The format is newline- or semicolon-separated `label=expression` pairs.
