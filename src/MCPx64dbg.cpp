@@ -2590,6 +2590,79 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                        << "}";
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
+                else if (path == "/Debug/WaitForBreakpointHit" || path == "/debug/waitforbreakpointhit") {
+                    std::string addrStr = queryParams["addr"];
+                    if (addrStr.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'addr' parameter\"}");
+                        continue;
+                    }
+
+                    duint addr = 0;
+                    if (!tryParseHexAddress(addrStr, addr)) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Invalid address format\"}");
+                        continue;
+                    }
+
+                    BRIDGEBP initialBp;
+                    if (!getBreakpointByAddress(addr, initialBp)) {
+                        sendHttpResponse(clientSocket, 404, "application/json",
+                            "{\"error\":\"Breakpoint not found\"}");
+                        continue;
+                    }
+
+                    int timeoutMs = 30000;
+                    if (!queryParams["timeoutMs"].empty()) {
+                        try { timeoutMs = std::stoi(queryParams["timeoutMs"]); } catch (...) {}
+                        if (timeoutMs < 0) timeoutMs = 0;
+                    }
+
+                    int baselineHitCount = initialBp.hitCount;
+                    if (!queryParams["baselineHitCount"].empty()) {
+                        try {
+                            baselineHitCount = std::stoi(queryParams["baselineHitCount"]);
+                        } catch (...) {
+                            sendHttpResponse(clientSocket, 400, "application/json",
+                                "{\"error\":\"Invalid baselineHitCount\"}");
+                            continue;
+                        }
+                    }
+
+                    bool timedOut = false;
+                    bool disappeared = false;
+                    BRIDGEBP currentBp = initialBp;
+                    unsigned long long startTick = GetTickCount64();
+                    while (currentBp.hitCount <= baselineHitCount) {
+                        if (GetTickCount64() - startTick >= static_cast<unsigned long long>(timeoutMs)) {
+                            timedOut = true;
+                            break;
+                        }
+                        Sleep(10);
+                        if (!getBreakpointByAddress(addr, currentBp)) {
+                            disappeared = true;
+                            break;
+                        }
+                    }
+
+                    if (disappeared) {
+                        sendHttpResponse(clientSocket, 404, "application/json",
+                            "{\"error\":\"Breakpoint disappeared while waiting\"}");
+                        continue;
+                    }
+
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"success\":true,"
+                       << "\"timedOut\":" << (timedOut ? "true" : "false") << ","
+                       << "\"baselineHitCount\":" << baselineHitCount << ","
+                       << "\"debugging\":" << (DbgIsDebugging() ? "true" : "false") << ","
+                       << "\"running\":" << (DbgIsRunning() ? "true" : "false") << ","
+                       << "\"breakpoint\":";
+                    appendBreakpointJson(ss, currentBp, "normal");
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
                 else if (path == "/Breakpoint/SetSilent") {
                     std::string addrStr = queryParams["addr"];
                     std::string silentStr = queryParams["silent"];
