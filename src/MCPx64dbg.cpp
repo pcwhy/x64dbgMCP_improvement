@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <Windows.h>
+#include <wincrypt.h>
 #include "bridgemain.h"
 #include "_plugins.h"
 #include "_scriptapi_module.h"
@@ -38,6 +39,7 @@
 #include <memory>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "Crypt32.lib")
 
 #ifdef _WIN64
 #define FMT_DUINT_HEX "0x%llx"
@@ -137,6 +139,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam);
 std::string readHttpRequest(SOCKET clientSocket);
 void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& contentType, const std::string& responseBody);
 void parseHttpRequest(const std::string& request, std::string& method, std::string& path, std::string& query, std::string& body);
+size_t parseHttpContentLength(const std::string& request);
 std::unordered_map<std::string, std::string> parseQueryParams(const std::string& query);
 std::string urlDecode(const std::string& str);
 std::string escapeJsonString(const char* str);
@@ -164,6 +167,10 @@ size_t eventLogSize();
 std::string readOutputDebugString(const OUTPUT_DEBUG_STRING_INFO* info);
 std::wstring utf8ToWide(const std::string& text);
 std::string win32ErrorMessage(DWORD error);
+bool base64Decode(const std::string& text, std::vector<unsigned char>& out, std::string& error);
+std::string base64Encode(const std::vector<unsigned char>& data);
+bool ensureDirectoryRecursive(const std::wstring& path, std::string& error);
+bool ensureParentDirectoryExists(const std::wstring& path, std::string& error);
 std::string buildProcessCommandLine(const std::string& program, const std::string& args);
 std::shared_ptr<HostExecJob> createHostExecJob(const std::string& program, const std::string& args, const std::string& cwd, std::string& error);
 std::shared_ptr<HostExecJob> getHostExecJob(unsigned long long jobId);
@@ -618,6 +625,131 @@ std::string win32ErrorMessage(DWORD error) {
     std::ostringstream ss;
     ss << message << " (code=" << error << ")";
     return ss.str();
+}
+
+bool base64Decode(const std::string& text, std::vector<unsigned char>& out, std::string& error) {
+    out.clear();
+    if (text.empty()) {
+        return true;
+    }
+    DWORD decodedSize = 0;
+    if (!CryptStringToBinaryA(text.c_str(), 0, CRYPT_STRING_BASE64, NULL, &decodedSize, NULL, NULL)) {
+        error = "CryptStringToBinaryA(size) failed: " + win32ErrorMessage(GetLastError());
+        return false;
+    }
+    out.resize(decodedSize);
+    if (!CryptStringToBinaryA(
+            text.c_str(),
+            0,
+            CRYPT_STRING_BASE64,
+            out.empty() ? NULL : out.data(),
+            &decodedSize,
+            NULL,
+            NULL)) {
+        error = "CryptStringToBinaryA(data) failed: " + win32ErrorMessage(GetLastError());
+        out.clear();
+        return false;
+    }
+    out.resize(decodedSize);
+    return true;
+}
+
+std::string base64Encode(const std::vector<unsigned char>& data) {
+    if (data.empty()) {
+        return "";
+    }
+    DWORD encodedSize = 0;
+    if (!CryptBinaryToStringA(
+            data.data(),
+            static_cast<DWORD>(data.size()),
+            CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+            NULL,
+            &encodedSize)) {
+        return "";
+    }
+    std::string encoded(encodedSize, '\0');
+    if (!CryptBinaryToStringA(
+            data.data(),
+            static_cast<DWORD>(data.size()),
+            CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+            &encoded[0],
+            &encodedSize)) {
+        return "";
+    }
+    if (!encoded.empty() && encoded.back() == '\0') {
+        encoded.pop_back();
+    }
+    return encoded;
+}
+
+static bool isPathSeparator(wchar_t ch) {
+    return ch == L'\\' || ch == L'/';
+}
+
+bool ensureDirectoryRecursive(const std::wstring& path, std::string& error) {
+    if (path.empty()) {
+        return true;
+    }
+
+    std::wstring normalized = path;
+    std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+
+    std::wstring current;
+    size_t pos = 0;
+    if (normalized.size() >= 2 && normalized[1] == L':') {
+        current = normalized.substr(0, 2);
+        pos = 2;
+        if (pos < normalized.size() && isPathSeparator(normalized[pos])) {
+            current.push_back(L'\\');
+            ++pos;
+        }
+    } else if (normalized.size() >= 2 && isPathSeparator(normalized[0]) && isPathSeparator(normalized[1])) {
+        current = L"\\\\";
+        pos = 2;
+    }
+
+    while (pos < normalized.size()) {
+        while (pos < normalized.size() && isPathSeparator(normalized[pos])) {
+            ++pos;
+        }
+        if (pos >= normalized.size()) {
+            break;
+        }
+        size_t nextPos = pos;
+        while (nextPos < normalized.size() && !isPathSeparator(normalized[nextPos])) {
+            ++nextPos;
+        }
+        std::wstring component = normalized.substr(pos, nextPos - pos);
+        if (!component.empty()) {
+            if (!current.empty() && !isPathSeparator(current.back())) {
+                current.push_back(L'\\');
+            }
+            current += component;
+            if (!CreateDirectoryW(current.c_str(), NULL)) {
+                DWORD createError = GetLastError();
+                if (createError != ERROR_ALREADY_EXISTS) {
+                    error = "CreateDirectoryW failed: " + win32ErrorMessage(createError);
+                    return false;
+                }
+                DWORD attrs = GetFileAttributesW(current.c_str());
+                if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    error = "Existing path is not a directory";
+                    return false;
+                }
+            }
+        }
+        pos = nextPos;
+    }
+
+    return true;
+}
+
+bool ensureParentDirectoryExists(const std::wstring& path, std::string& error) {
+    size_t slashPos = path.find_last_of(L"\\/");
+    if (slashPos == std::wstring::npos) {
+        return true;
+    }
+    return ensureDirectoryRecursive(path.substr(0, slashPos), error);
 }
 
 std::string buildProcessCommandLine(const std::string& program, const std::string& args) {
@@ -1277,6 +1409,247 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     ss << "\"success\":true,";
                     ss << "\"cleared\":" << oldExpressions.size();
                     ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/File/Stat" || path == "/file/stat") {
+                    std::string rawPath = urlDecode(queryParams["path"]);
+                    trimParam(rawPath);
+                    if (rawPath.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'path' parameter\"}");
+                        continue;
+                    }
+                    std::wstring widePath = utf8ToWide(rawPath);
+                    WIN32_FILE_ATTRIBUTE_DATA data;
+                    bool exists = GetFileAttributesExW(widePath.c_str(), GetFileExInfoStandard, &data) == TRUE;
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"path\":\"" << escapeJsonString(rawPath.c_str()) << "\","
+                       << "\"exists\":" << (exists ? "true" : "false");
+                    if (exists) {
+                        ULARGE_INTEGER fileSize;
+                        fileSize.HighPart = data.nFileSizeHigh;
+                        fileSize.LowPart = data.nFileSizeLow;
+                        ULARGE_INTEGER lastWrite;
+                        lastWrite.HighPart = data.ftLastWriteTime.dwHighDateTime;
+                        lastWrite.LowPart = data.ftLastWriteTime.dwLowDateTime;
+                        ss << ",\"isDirectory\":" << ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "true" : "false")
+                           << ",\"size\":" << fileSize.QuadPart
+                           << ",\"lastWriteTimeUtc100ns\":" << lastWrite.QuadPart
+                           << ",\"attributes\":" << static_cast<unsigned long long>(data.dwFileAttributes);
+                    }
+                    ss << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/File/Mkdir" || path == "/file/mkdir") {
+                    std::string rawPath = urlDecode(queryParams["path"]);
+                    trimParam(rawPath);
+                    if (rawPath.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'path' parameter\"}");
+                        continue;
+                    }
+                    std::string error;
+                    bool ok = ensureDirectoryRecursive(utf8ToWide(rawPath), error);
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"success\":" << (ok ? "true" : "false") << ","
+                       << "\"path\":\"" << escapeJsonString(rawPath.c_str()) << "\"";
+                    if (!ok) {
+                        ss << ",\"error\":\"" << escapeJsonString(error.c_str()) << "\"";
+                    }
+                    ss << "}";
+                    sendHttpResponse(clientSocket, ok ? 200 : 500, "application/json", ss.str());
+                }
+                else if (path == "/File/Read" || path == "/file/read") {
+                    std::string rawPath = urlDecode(queryParams["path"]);
+                    trimParam(rawPath);
+                    if (rawPath.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'path' parameter\"}");
+                        continue;
+                    }
+                    unsigned long long offset = 0;
+                    if (!queryParams["offset"].empty()) {
+                        try {
+                            offset = std::stoull(queryParams["offset"]);
+                        } catch (...) {
+                            sendHttpResponse(clientSocket, 400, "application/json",
+                                "{\"error\":\"Invalid offset\"}");
+                            continue;
+                        }
+                    }
+                    unsigned long long requestedSize = 0;
+                    if (!queryParams["size"].empty()) {
+                        try {
+                            requestedSize = std::stoull(queryParams["size"]);
+                        } catch (...) {
+                            sendHttpResponse(clientSocket, 400, "application/json",
+                                "{\"error\":\"Invalid size\"}");
+                            continue;
+                        }
+                    }
+
+                    std::wstring widePath = utf8ToWide(rawPath);
+                    WIN32_FILE_ATTRIBUTE_DATA data;
+                    if (!GetFileAttributesExW(widePath.c_str(), GetFileExInfoStandard, &data)) {
+                        std::ostringstream ss;
+                        ss << "{\"error\":\""
+                           << escapeJsonString(win32ErrorMessage(GetLastError()).c_str())
+                           << "\"}";
+                        sendHttpResponse(clientSocket, 404, "application/json", ss.str());
+                        continue;
+                    }
+                    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Path is a directory\"}");
+                        continue;
+                    }
+
+                    ULARGE_INTEGER fileSize;
+                    fileSize.HighPart = data.nFileSizeHigh;
+                    fileSize.LowPart = data.nFileSizeLow;
+                    if (offset > fileSize.QuadPart) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Offset beyond end of file\"}");
+                        continue;
+                    }
+                    unsigned long long available = fileSize.QuadPart - offset;
+                    unsigned long long readSize = requestedSize == 0 ? available : std::min(available, requestedSize);
+                    if (readSize > 4ull * 1024ull * 1024ull) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Requested read too large (max 4194304 bytes)\"}");
+                        continue;
+                    }
+
+                    HANDLE fileHandle = CreateFileW(
+                        widePath.c_str(),
+                        GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL,
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL,
+                        NULL);
+                    if (fileHandle == INVALID_HANDLE_VALUE) {
+                        std::ostringstream ss;
+                        ss << "{\"error\":\""
+                           << escapeJsonString(win32ErrorMessage(GetLastError()).c_str())
+                           << "\"}";
+                        sendHttpResponse(clientSocket, 500, "application/json", ss.str());
+                        continue;
+                    }
+
+                    LARGE_INTEGER moveOffset;
+                    moveOffset.QuadPart = static_cast<LONGLONG>(offset);
+                    bool seekOk = SetFilePointerEx(fileHandle, moveOffset, NULL, FILE_BEGIN) == TRUE;
+                    std::vector<unsigned char> bytes(static_cast<size_t>(readSize));
+                    DWORD bytesRead = 0;
+                    bool readOk = seekOk && (readSize == 0 || ReadFile(fileHandle, bytes.data(), static_cast<DWORD>(readSize), &bytesRead, NULL) == TRUE);
+                    CloseHandle(fileHandle);
+
+                    if (!readOk) {
+                        std::ostringstream ss;
+                        ss << "{\"error\":\""
+                           << escapeJsonString(win32ErrorMessage(GetLastError()).c_str())
+                           << "\"}";
+                        sendHttpResponse(clientSocket, 500, "application/json", ss.str());
+                        continue;
+                    }
+                    bytes.resize(bytesRead);
+                    std::string dataB64 = base64Encode(bytes);
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"path\":\"" << escapeJsonString(rawPath.c_str()) << "\","
+                       << "\"offset\":" << offset << ","
+                       << "\"size\":" << bytesRead << ","
+                       << "\"dataB64\":\"" << escapeJsonString(dataB64.c_str()) << "\""
+                       << "}";
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
+                else if (path == "/File/Write" || path == "/file/write") {
+                    std::string rawPath = urlDecode(queryParams["path"]);
+                    trimParam(rawPath);
+                    if (rawPath.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing required 'path' parameter\"}");
+                        continue;
+                    }
+                    bool append = false;
+                    if (!queryParams["append"].empty()) {
+                        std::string appendValue = urlDecode(queryParams["append"]);
+                        std::transform(appendValue.begin(), appendValue.end(), appendValue.begin(), [](unsigned char ch) {
+                            return static_cast<char>(std::tolower(ch));
+                        });
+                        append = appendValue == "1" || appendValue == "true" || appendValue == "yes" || appendValue == "on";
+                    }
+
+                    std::string dataB64 = body.empty() ? urlDecode(queryParams["dataB64"]) : body;
+                    trimParam(dataB64);
+                    if (dataB64.empty()) {
+                        sendHttpResponse(clientSocket, 400, "application/json",
+                            "{\"error\":\"Missing base64 payload\"}");
+                        continue;
+                    }
+
+                    std::vector<unsigned char> bytes;
+                    std::string decodeError;
+                    if (!base64Decode(dataB64, bytes, decodeError)) {
+                        std::ostringstream ss;
+                        ss << "{\"error\":\"" << escapeJsonString(decodeError.c_str()) << "\"}";
+                        sendHttpResponse(clientSocket, 400, "application/json", ss.str());
+                        continue;
+                    }
+
+                    std::wstring widePath = utf8ToWide(rawPath);
+                    std::string mkdirError;
+                    if (!ensureParentDirectoryExists(widePath, mkdirError)) {
+                        std::ostringstream ss;
+                        ss << "{\"error\":\"" << escapeJsonString(mkdirError.c_str()) << "\"}";
+                        sendHttpResponse(clientSocket, 500, "application/json", ss.str());
+                        continue;
+                    }
+
+                    HANDLE fileHandle = CreateFileW(
+                        widePath.c_str(),
+                        GENERIC_WRITE,
+                        FILE_SHARE_READ,
+                        NULL,
+                        append ? OPEN_ALWAYS : CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL,
+                        NULL);
+                    if (fileHandle == INVALID_HANDLE_VALUE) {
+                        std::ostringstream ss;
+                        ss << "{\"error\":\""
+                           << escapeJsonString(win32ErrorMessage(GetLastError()).c_str())
+                           << "\"}";
+                        sendHttpResponse(clientSocket, 500, "application/json", ss.str());
+                        continue;
+                    }
+                    bool seekOk = true;
+                    if (append) {
+                        LARGE_INTEGER zero;
+                        zero.QuadPart = 0;
+                        seekOk = SetFilePointerEx(fileHandle, zero, NULL, FILE_END) == TRUE;
+                    }
+                    DWORD bytesWritten = 0;
+                    bool writeOk = seekOk && (bytes.empty() || WriteFile(fileHandle, bytes.data(), static_cast<DWORD>(bytes.size()), &bytesWritten, NULL) == TRUE);
+                    CloseHandle(fileHandle);
+                    if (!writeOk) {
+                        std::ostringstream ss;
+                        ss << "{\"error\":\""
+                           << escapeJsonString(win32ErrorMessage(GetLastError()).c_str())
+                           << "\"}";
+                        sendHttpResponse(clientSocket, 500, "application/json", ss.str());
+                        continue;
+                    }
+
+                    std::ostringstream ss;
+                    ss << "{"
+                       << "\"success\":true,"
+                       << "\"path\":\"" << escapeJsonString(rawPath.c_str()) << "\","
+                       << "\"append\":" << (append ? "true" : "false") << ","
+                       << "\"bytesWritten\":" << bytesWritten
+                       << "}";
                     sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/Host/Spawn" || path == "/host/spawn") {
@@ -3540,7 +3913,8 @@ std::string readHttpRequest(SOCKET clientSocket) {
     u_long mode = 0;
     ioctlsocket(clientSocket, FIONBIO, &mode);
 
-    while (request.find("\r\n\r\n") == std::string::npos && request.length() < MAX_REQUEST_SIZE - 1) {
+    size_t expectedLength = 0;
+    while (request.length() < MAX_REQUEST_SIZE - 1) {
         int remaining = MAX_REQUEST_SIZE - 1 - (int)request.length();
         int chunkSize = remaining < (int)sizeof(buffer) - 1 ? remaining : (int)sizeof(buffer) - 1;
         int bytesReceived = recv(clientSocket, buffer, chunkSize, 0);
@@ -3549,7 +3923,14 @@ std::string readHttpRequest(SOCKET clientSocket) {
         }
         buffer[bytesReceived] = '\0';
         request.append(buffer, bytesReceived);
-        if (bytesReceived < chunkSize) {
+        size_t headersEnd = request.find("\r\n\r\n");
+        if (headersEnd != std::string::npos && expectedLength == 0) {
+            expectedLength = headersEnd + 4 + parseHttpContentLength(request);
+        }
+        if (expectedLength != 0 && request.length() >= expectedLength) {
+            break;
+        }
+        if (headersEnd == std::string::npos && bytesReceived < chunkSize) {
             break;
         }
     }
@@ -3590,6 +3971,31 @@ void parseHttpRequest(const std::string& request, std::string& method, std::stri
         return;
     }
     body = request.substr(headersEnd + 4);
+}
+
+size_t parseHttpContentLength(const std::string& request) {
+    size_t headersEnd = request.find("\r\n\r\n");
+    std::string headers = headersEnd == std::string::npos ? request : request.substr(0, headersEnd);
+    std::string lower = headers;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    size_t keyPos = lower.find("content-length:");
+    if (keyPos == std::string::npos) {
+        return 0;
+    }
+    size_t valueStart = keyPos + strlen("content-length:");
+    size_t lineEnd = lower.find("\r\n", valueStart);
+    std::string value = headers.substr(valueStart, lineEnd == std::string::npos ? std::string::npos : lineEnd - valueStart);
+    trimParam(value);
+    if (value.empty()) {
+        return 0;
+    }
+    try {
+        return static_cast<size_t>(std::stoull(value));
+    } catch (...) {
+        return 0;
+    }
 }
 
 void sendHttpResponse(SOCKET clientSocket, int statusCode, const std::string& contentType, const std::string& responseBody) {
