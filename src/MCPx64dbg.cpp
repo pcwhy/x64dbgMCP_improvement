@@ -1,5 +1,6 @@
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 
 #include <Windows.h>
 #include <wincrypt.h>
@@ -1515,7 +1516,7 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                         continue;
                     }
                     unsigned long long available = fileSize.QuadPart - offset;
-                    unsigned long long readSize = requestedSize == 0 ? available : std::min(available, requestedSize);
+                    unsigned long long readSize = requestedSize == 0 ? available : (std::min)(available, requestedSize);
                     if (readSize > 4ull * 1024ull * 1024ull) {
                         sendHttpResponse(clientSocket, 400, "application/json",
                             "{\"error\":\"Requested read too large (max 4194304 bytes)\"}");
