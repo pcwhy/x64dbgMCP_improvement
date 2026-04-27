@@ -147,6 +147,8 @@ std::string escapeJsonString(const char* str);
 static void trimParam(std::string& s);
 bool resolveListenAddress(const std::string& host, sockaddr_in& serverAddr);
 std::string debugActionName(DebugAction action);
+bool isDebugActionQueueEmpty();
+size_t getDebugActionQueueSize();
 std::string breakpointTypeName(BPXTYPE type);
 bool tryParseHexAddress(const std::string& value, duint& addr);
 bool tryParseExpressionValue(const char* expression, duint& value);
@@ -172,6 +174,7 @@ bool base64Decode(const std::string& text, std::vector<unsigned char>& out, std:
 std::string base64Encode(const std::vector<unsigned char>& data);
 bool ensureDirectoryRecursive(const std::wstring& path, std::string& error);
 bool ensureParentDirectoryExists(const std::wstring& path, std::string& error);
+void appendDebugWaitStateJson(std::ostream& ss, bool timedOut, bool running, bool queueEmpty);
 std::string buildProcessCommandLine(const std::string& program, const std::string& args);
 std::shared_ptr<HostExecJob> createHostExecJob(const std::string& program, const std::string& args, const std::string& cwd, std::string& error);
 std::shared_ptr<HostExecJob> getHostExecJob(unsigned long long jobId);
@@ -288,6 +291,16 @@ std::string breakpointTypeName(BPXTYPE type) {
         case bp_exception: return "exception";
         default: return "unknown";
     }
+}
+
+bool isDebugActionQueueEmpty() {
+    std::lock_guard<std::mutex> lock(g_debugActionMutex);
+    return g_debugActionQueue.empty();
+}
+
+size_t getDebugActionQueueSize() {
+    std::lock_guard<std::mutex> lock(g_debugActionMutex);
+    return g_debugActionQueue.size();
 }
 
 bool tryParseHexAddress(const std::string& value, duint& addr) {
@@ -751,6 +764,22 @@ bool ensureParentDirectoryExists(const std::wstring& path, std::string& error) {
         return true;
     }
     return ensureDirectoryRecursive(path.substr(0, slashPos), error);
+}
+
+void appendDebugWaitStateJson(std::ostream& ss, bool timedOut, bool running, bool queueEmpty) {
+    duint ip = Script::Register::Get(REG_IP);
+    char ipBuf[32] = {};
+    snprintf(ipBuf, sizeof(ipBuf), FMT_DUINT_HEX, DUINT_CAST_PRINTF(ip));
+    ss << "{"
+       << "\"success\":true,"
+       << "\"timedOut\":" << (timedOut ? "true" : "false") << ","
+       << "\"debugging\":" << (DbgIsDebugging() ? "true" : "false") << ","
+       << "\"running\":" << (running ? "true" : "false") << ","
+       << "\"queueEmpty\":" << (queueEmpty ? "true" : "false") << ","
+       << "\"queueSize\":" << getDebugActionQueueSize() << ","
+       << "\"tickMs\":" << GetTickCount64() << ","
+       << "\"ip\":\"" << ipBuf << "\""
+       << "}";
 }
 
 std::string buildProcessCommandLine(const std::string& program, const std::string& args) {
@@ -2160,6 +2189,47 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     sendHttpResponse(clientSocket, queued ? 202 : 500, "application/json",
                         queued ? "{\"queued\":true,\"action\":\"Run\"}" : "{\"queued\":false,\"error\":\"Debug action worker is not running\"}");
                 }
+                else if (path == "/Debug/WaitForBreak" || path == "/debug/waitforbreak") {
+                    int timeoutMs = 30000;
+                    if (!queryParams["timeoutMs"].empty()) {
+                        try { timeoutMs = std::stoi(queryParams["timeoutMs"]); } catch (...) {}
+                        if (timeoutMs < 0) timeoutMs = 0;
+                    }
+                    bool initialRunning = DbgIsRunning();
+                    bool initialQueuePending = !isDebugActionQueueEmpty();
+                    bool running = initialRunning;
+                    bool queueEmpty = !initialQueuePending;
+                    bool seenRunning = initialRunning;
+                    bool timedOut = false;
+
+                    if (!(initialQueuePending || initialRunning)) {
+                        std::ostringstream ss;
+                        appendDebugWaitStateJson(ss, false, running, queueEmpty);
+                        sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                        continue;
+                    }
+
+                    unsigned long long startTick = GetTickCount64();
+                    while (true) {
+                        running = DbgIsRunning();
+                        queueEmpty = isDebugActionQueueEmpty();
+                        if (running) {
+                            seenRunning = true;
+                        }
+                        if (!running && queueEmpty && (seenRunning || initialQueuePending || initialRunning)) {
+                            break;
+                        }
+                        if (GetTickCount64() - startTick >= static_cast<unsigned long long>(timeoutMs)) {
+                            timedOut = true;
+                            break;
+                        }
+                        Sleep(10);
+                    }
+
+                    std::ostringstream ss;
+                    appendDebugWaitStateJson(ss, timedOut, running, queueEmpty);
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
+                }
                 else if (path == "/Debug/Pause") {
                     sendHttpResponse(clientSocket, 409, "application/json",
                         "{\"ok\":false,\"error\":\"Synchronous Debug/Pause is disabled; use /Debug/PauseAsync.\"}");
@@ -2168,6 +2238,31 @@ DWORD WINAPI HttpServerThread(LPVOID lpParam) {
                     bool queued = queueDebugAction(DebugAction::Pause);
                     sendHttpResponse(clientSocket, queued ? 202 : 500, "application/json",
                         queued ? "{\"queued\":true,\"action\":\"Pause\"}" : "{\"queued\":false,\"error\":\"Debug action worker is not running\"}");
+                }
+                else if (path == "/Debug/WaitForIdle" || path == "/debug/waitforidle") {
+                    int timeoutMs = 30000;
+                    if (!queryParams["timeoutMs"].empty()) {
+                        try { timeoutMs = std::stoi(queryParams["timeoutMs"]); } catch (...) {}
+                        if (timeoutMs < 0) timeoutMs = 0;
+                    }
+                    bool running = DbgIsRunning();
+                    bool queueEmpty = isDebugActionQueueEmpty();
+                    bool timedOut = false;
+                    unsigned long long startTick = GetTickCount64();
+
+                    while (running || !queueEmpty) {
+                        if (GetTickCount64() - startTick >= static_cast<unsigned long long>(timeoutMs)) {
+                            timedOut = true;
+                            break;
+                        }
+                        Sleep(10);
+                        running = DbgIsRunning();
+                        queueEmpty = isDebugActionQueueEmpty();
+                    }
+
+                    std::ostringstream ss;
+                    appendDebugWaitStateJson(ss, timedOut, running, queueEmpty);
+                    sendHttpResponse(clientSocket, 200, "application/json", ss.str());
                 }
                 else if (path == "/Debug/Stop") {
                     sendHttpResponse(clientSocket, 409, "application/json",
