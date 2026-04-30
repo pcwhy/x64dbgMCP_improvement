@@ -1,22 +1,27 @@
 import sys
-import os
 import inspect
 import json
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional
 import requests
 
 from mcp.server.fastmcp import FastMCP
+try:
+    from x64dbg_tools.url_config import DEFAULT_LOCAL_X64DBG_URL, resolve_x64dbg_url
+except ModuleNotFoundError:
+    _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+    _ROOT_DIR = os.path.dirname(_TOOLS_DIR)
+    if _ROOT_DIR not in sys.path:
+        sys.path.insert(0, _ROOT_DIR)
+    from x64dbg_tools.url_config import DEFAULT_LOCAL_X64DBG_URL, resolve_x64dbg_url
 
-DEFAULT_X64DBG_SERVER = "http://192.168.1.212:8888/"
+DEFAULT_X64DBG_SERVER = DEFAULT_LOCAL_X64DBG_URL
 
 def _resolve_server_url_from_args_env() -> str:
-    env_url = os.getenv("X64DBG_URL")
-    if env_url and env_url.startswith("http"):
-        return env_url
     if len(sys.argv) > 1 and isinstance(sys.argv[1], str) and sys.argv[1].startswith("http"):
         return sys.argv[1]
-    return DEFAULT_X64DBG_SERVER
+    return resolve_x64dbg_url(DEFAULT_X64DBG_SERVER)
 
 x64dbg_server_url = _resolve_server_url_from_args_env()
 
@@ -77,13 +82,13 @@ def safe_get(endpoint: str, params: dict = None, timeout: float = 15):
         params = {}
     return _request("GET", endpoint, params=params, timeout=timeout)
 
-def safe_post(endpoint: str, data: dict | str):
+def safe_post(endpoint: str, data: dict | str, params: dict | None = None, timeout: float = 5):
     """
     Perform a POST request with data.
     Returns parsed JSON if possible, otherwise text content
     """
     payload = data if isinstance(data, dict) else data.encode("utf-8")
-    return _request("POST", endpoint, data=payload, timeout=5)
+    return _request("POST", endpoint, params=params, data=payload, timeout=timeout)
 
 
 def _get_mcp_tools_registry() -> Dict[str, Callable[..., Any]]:
@@ -178,6 +183,22 @@ def _block_to_dict(block: Any) -> Dict[str, Any]:
         }
     # Fallback generic representation
     return {"type": str(btype or "unknown"), "raw": str(block)}
+
+
+@mcp.tool()
+def Health() -> dict:
+    """
+    Read the x64dbg plugin health/status payload.
+    """
+    result = safe_get("Health")
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
 
 
 @mcp.tool()
@@ -371,6 +392,91 @@ def HostJobKill(job_id: int) -> dict:
         job_id: Host job id
     """
     result = safe_get("Host/Job/Kill", {"id": job_id})
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def FileStat(path: str) -> dict:
+    """
+    Read metadata about a file or directory on the Windows host.
+
+    Parameters:
+        path: Absolute Windows path
+    """
+    result = safe_get("File/Stat", {"path": path})
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def FileMkdir(path: str) -> dict:
+    """
+    Create a directory tree on the Windows host.
+
+    Parameters:
+        path: Absolute Windows directory path
+    """
+    result = safe_post("File/Mkdir", "", params={"path": path})
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def FileRead(path: str, offset: int = 0, size: int = 0) -> dict:
+    """
+    Read a file from the Windows host and return a base64 payload.
+
+    Parameters:
+        path: Absolute Windows file path
+        offset: Optional byte offset
+        size: Optional byte count. Use 0 to read to EOF.
+    """
+    result = safe_get("File/Read", {"path": path, "offset": offset, "size": size}, timeout=30)
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def FileWrite(path: str, data_b64: str, append: bool = False) -> dict:
+    """
+    Write a base64-decoded file payload to the Windows host.
+
+    Parameters:
+        path: Absolute Windows file path
+        data_b64: Base64 payload
+        append: If True, append to an existing file instead of overwriting
+    """
+    result = safe_post(
+        "File/Write",
+        data_b64,
+        params={"path": path, "append": str(append).lower()},
+        timeout=30,
+    )
     if isinstance(result, dict):
         return result
     if isinstance(result, str):
@@ -596,6 +702,25 @@ def DebugRunAsync() -> str:
     """
     return safe_get("Debug/RunAsync")
 
+
+@mcp.tool()
+def WaitForBreak(timeout_ms: int = 30000) -> dict:
+    """
+    Wait until the debugger returns to a break state or the timeout expires.
+
+    Parameters:
+        timeout_ms: Maximum wait time in milliseconds
+    """
+    result = safe_get("Debug/WaitForBreak", {"timeoutMs": timeout_ms}, timeout=max(15.0, float(timeout_ms) / 1000.0 + 10.0))
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
 @mcp.tool()
 def DebugPause() -> str:
     """
@@ -612,6 +737,50 @@ def DebugPauseAsync() -> str:
     Queue a non-blocking pause request for the debugged process.
     """
     return safe_get("Debug/PauseAsync")
+
+
+@mcp.tool()
+def WaitForIdle(timeout_ms: int = 30000) -> dict:
+    """
+    Wait until the debugger is not running and the async debug-action queue is empty.
+
+    Parameters:
+        timeout_ms: Maximum wait time in milliseconds
+    """
+    result = safe_get("Debug/WaitForIdle", {"timeoutMs": timeout_ms}, timeout=max(15.0, float(timeout_ms) / 1000.0 + 10.0))
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
+
+
+@mcp.tool()
+def WaitForBreakpointHit(addr: str, timeout_ms: int = 30000, baseline_hit_count: Optional[int] = None) -> dict:
+    """
+    Wait until a specific breakpoint's hitCount increases past the baseline.
+
+    Parameters:
+        addr: Breakpoint address (hex string)
+        timeout_ms: Maximum wait time in milliseconds
+        baseline_hit_count: Optional explicit hit-count baseline. If omitted,
+            the plugin uses the breakpoint's current hitCount as the baseline.
+    """
+    params: Dict[str, Any] = {"addr": addr, "timeoutMs": timeout_ms}
+    if baseline_hit_count is not None:
+        params["baselineHitCount"] = baseline_hit_count
+    result = safe_get("Debug/WaitForBreakpointHit", params, timeout=max(15.0, float(timeout_ms) / 1000.0 + 10.0))
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return {"error": "Failed to parse response", "raw": result}
+    return {"error": "Unexpected response format"}
 
 @mcp.tool()
 def DebugStop() -> str:

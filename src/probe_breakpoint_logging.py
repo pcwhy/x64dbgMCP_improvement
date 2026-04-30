@@ -9,8 +9,9 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from x64dbg_tools.url_config import add_x64dbg_url_argument, resolve_x64dbg_url
 
-DEFAULT_URL = "http://192.168.1.212:8888/"
+DEFAULT_URL = resolve_x64dbg_url()
 DEFAULT_ADDR = "0x004011C9"
 
 
@@ -98,7 +99,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Probe x64dbg breakpoint logging support by trying candidate command-bar commands and verifying the breakpoint fields.",
     )
-    parser.add_argument("--url", default=DEFAULT_URL, help="x64dbgMCP base URL")
+    add_x64dbg_url_argument(parser, default=DEFAULT_URL)
     parser.add_argument(
         "--addr",
         default=DEFAULT_ADDR,
