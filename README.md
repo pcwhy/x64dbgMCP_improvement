@@ -2,6 +2,29 @@
 
 This repository contains a patched and extended build of the x64dbg MCP/HTTP plugin used for remote-assisted x32dbg/x64dbg debugging.
 
+Operational rule for this repository:
+
+- do not rely on historical hard-coded VM IPs
+- prefer an explicit `--x64dbg-url http://<vm-ip>:8888/` for LAN sessions
+- MusicBox15 helper scripts also accept `--url` as a backward-compatible alias
+- or set `X64DBG_URL` in the shell before running helper scripts
+- if neither is set, local helper scripts now fall back to `http://127.0.0.1:8888/`
+- for HostExec helpers, you can also preconfigure:
+  - `X64DBG_REMOTE_PYTHON`
+  - `X64DBG_REMOTE_POWERSHELL`
+  - `X64DBG_HOSTEXEC_CWD`
+  - `X64DBG_HOSTEXEC_TIMEOUT_MS`
+- `x64dbg_tools/x64dbg.py` now supports both:
+  - module execution: `python -m x64dbg_tools.x64dbg ...`
+  - direct script execution: `python x64dbg_tools/x64dbg.py ...`
+
+Use this README for the local role of `x64dbg_tools/` and the generic bridge
+tooling surface. For repository-wide navigation, use
+`docs/functional_file_map.md`. For placement rules, use
+`docs/file_organization_rules.md`. For MusicBox15-specific helper assets, use
+`x64dbg_tools/musicbox15/README.md`. For wrapper and migration history, use
+`docs/repository_reorganization_audit.md`.
+
 Original upstream project:
 
 <https://github.com/Wasdubya/x64dbgMCP>
@@ -19,6 +42,18 @@ During reverse engineering work with x32dbg inside a Windows VM, two limitations
 
 This fork addresses those two issues while preserving the original command style.
 
+Historical design notes that are no longer on the main reading path now live in:
+
+- `docs/archive/x64dbg_mcp_plugin_improvement_plan.md`
+
+MusicBox15-specific helper scripts and breakpoint/label presets now live in:
+
+- `x64dbg_tools/musicbox15/`
+
+The former `x64dbg_tools/`-level MusicBox15 wrapper mirrors were retired after
+active references converged on those canonical paths. Historical wrapper
+transitions are tracked in `docs/repository_reorganization_audit.md`.
+
 ## Main Changes
 
 - Added configurable HTTP listen host via the `httphost` x64dbg command.
@@ -32,6 +67,41 @@ This fork addresses those two issues while preserving the original command style
   - `/Debug/StepInAsync`
   - `/Debug/StepOverAsync`
   - `/Debug/StepOutAsync`
+- Added wait-oriented debug endpoints so clients can stop scattering `sleep`
+  loops:
+  - `/Debug/WaitForBreak`
+  - `/Debug/WaitForIdle`
+- Added a breakpoint-specific wait endpoint:
+  - `/Debug/WaitForBreakpointHit`
+
+Operational rule for wait endpoints:
+
+- use `WaitFor*` only for short, automation-controlled convergence after the
+  client has already triggered the next debugger state
+- do not use `WaitFor*` for phases that require a human to click buttons,
+  load a sample, change UI state, or otherwise perform manual actions
+- for user-driven phases, return control to the user first, then issue a fresh
+  query or wait call only after the user reports the action is complete
+
+Operational rule for breakpoint scenarios:
+
+- treat multi-breakpoint experiment setups as script-layer workflows, not as a
+  plugin-native profile system
+- use the existing `/Breakpoint/*`, `/Log/BreakpointContext/*`, and `/Log/Clear`
+  primitives plus target-specific `configure_*_logging.py` helpers to arm or
+  clear a whole scene
+- do not expand the plugin with `/Breakpoint/Profile/*` unless a concrete need
+  appears that cannot be solved cleanly in the helper layer
+
+Recommended breakpoint workflow:
+
+1. Use helper scripts to arm exactly one focused scene.
+2. If the next phase needs human GUI input, stop and return control to the user.
+3. After the user confirms the action is complete, query logs or breakpoint
+   state again.
+4. Use `WaitForBreak`, `WaitForIdle`, or `WaitForBreakpointHit` only when the
+   client has already triggered the next debugger state itself and only for
+   short, automation-controlled waits.
 - Added a debug action worker thread so async run/step requests return immediately.
 - Added a plugin-side event buffer plus HTTP log endpoints so remote clients can read recent breakpoint/debug-string events without scraping the x64dbg GUI log window.
 - Extended `/Log/Recent` with pagination metadata, `since`-based forward reads, and `limit=-1` full-buffer reads.
@@ -58,6 +128,11 @@ This fork addresses those two issues while preserving the original command style
   - `/Host/Exec`
   - `/Host/Job/Get`
   - `/Host/Job/Kill`
+- Added a minimal native file surface inside the plugin:
+  - `/File/Stat`
+  - `/File/Read`
+  - `/File/Write`
+  - `/File/Mkdir`
 - Added Python-side bridge helpers for host execution and generic helper CLIs for:
   - host process invocation
   - message-capture initialization
@@ -72,6 +147,9 @@ This fork addresses those two issues while preserving the original command style
 - Added bidirectional file-transfer helpers on top of `HostExec` and remote Python:
   - `push_file_via_hostexec.py` uploads local files to a Windows VM path in verified chunks
   - `pull_file_via_hostexec.py` downloads remote files back in verified chunks
+- Prefer the native `/File/*` endpoints for simple stat/read/write/mkdir work.
+  Keep the `HostExec` transfer helpers as the fallback path for larger or more
+  specialized workflows.
 - Added a socket receive timeout to avoid stalled client connections blocking the HTTP thread.
 - Disabled the old synchronous `/Disasm/StepInWithDisasm` endpoint because it performed a direct step inside the HTTP request handler.
 - Fixed HTTP server start/stop state handling to avoid a potential self-lock/restart issue.
@@ -559,7 +637,7 @@ be replayed through the bridge without opening a separate shell:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --program "C:\Python314\python.exe" \
+  --program "<remote-python>" \
   --cwd "C:\work\capture_demo" \
   --args "\"replay_message_replayish.py\" \"message_capture_export.json\" --dry-run" \
   --timeout-ms 20000
@@ -577,7 +655,7 @@ Push the replay script:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/push_file_via_hostexec.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --remote-python "C:\Python314\python.exe" \
+  --remote-python "<remote-python>" \
   x64dbg_tools/replay_message_replayish.py \
   "C:\work\capture_demo\replay_message_replayish.py"
 ```
@@ -587,9 +665,25 @@ Push the exported action JSON:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/push_file_via_hostexec.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --remote-python "C:\Python314\python.exe" \
+  --remote-python "<remote-python>" \
   tmp/message_capture_export.json \
   "C:\work\capture_demo\message_capture_export.json"
+```
+
+If the VM does not have a convenient Python entry point, use the PowerShell/.NET
+variant instead:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/push_file_via_hostexec_powershell.py \
+  --x64dbg-url http://<vm-ip>:8888/ \
+  local_file.bin \
+  "C:\work\remote_file.bin"
+```
+
+On the current MusicBox VM, the confirmed Python path is:
+
+```text
+C:\Users\zyjsuper\AppData\Local\Programs\Python\Python314\python.exe
 ```
 
 By default the helper verifies the remote file size and SHA-256 hash after the
@@ -600,7 +694,7 @@ Pull a generated file or log back from the VM:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/pull_file_via_hostexec.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --remote-python "C:\Python314\python.exe" \
+  --remote-python "<remote-python>" \
   "C:\work\capture_demo\message_capture_export.json" \
   tmp/message_capture_export.from_vm.json
 ```
@@ -634,13 +728,13 @@ Client timeout behavior:
 Start asynchronously:
 
 ```text
-/Host/Spawn?program=C:\Python314\python.exe&args=C:\work\scripts\replay_message_replayish.py%20C:\work\tmp\capture_export.json&cwd=C:\work
+/Host/Spawn?program=<remote-python>&args=C:\work\scripts\replay_message_replayish.py%20C:\work\tmp\capture_export.json&cwd=C:\work
 ```
 
 Execute and wait up to `timeoutMs`:
 
 ```text
-/Host/Exec?program=C:\Python314\python.exe&args=C:\work\scripts\replay_message_replayish.py%20C:\work\tmp\capture_export.json%20--dry-run&cwd=C:\work&timeoutMs=30000
+/Host/Exec?program=<remote-python>&args=C:\work\scripts\replay_message_replayish.py%20C:\work\tmp\capture_export.json%20--dry-run&cwd=C:\work&timeoutMs=30000
 ```
 
 Read job state:
@@ -676,7 +770,7 @@ invoke the host execution surface without writing ad-hoc `python -c` glue:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --program "C:\Python314\python.exe" \
+  --program "<remote-python>" \
   --args=-V \
   --timeout-ms 10000
 ```
@@ -700,7 +794,7 @@ Typical usage:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/push_file_via_hostexec.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --remote-python "C:\Python314\python.exe" \
+  --remote-python "<remote-python>" \
   local_file.bin \
   "C:\work\remote_file.bin"
 ```
@@ -711,6 +805,26 @@ Useful options:
 - `--chunk-size`: raw bytes per upload chunk
 - `--timeout-ms`: per-chunk host-exec timeout
 - `--no-verify`: skip remote size/hash verification
+
+### Remote File Upload Helper (PowerShell/.NET)
+
+`x64dbg_tools/push_file_via_hostexec_powershell.py` provides the same upload
+surface without requiring remote Python. It uses:
+
+1. `HostExec` with Windows PowerShell
+2. base64 chunks
+3. `[IO.File]::WriteAllBytes(...)` for the first chunk
+4. a .NET `FileStream` append path for follow-up chunks
+5. `SHA256Managed` for remote verification
+
+Typical usage:
+
+```text
+rtk x64dbgvenv/bin/python x64dbg_tools/push_file_via_hostexec_powershell.py \
+  --x64dbg-url http://<vm-ip>:8888/ \
+  local_file.bin \
+  "C:\work\remote_file.bin"
+```
 
 ### Remote File Download Helper
 
@@ -730,7 +844,7 @@ Typical usage:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/pull_file_via_hostexec.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --remote-python "C:\Python314\python.exe" \
+  --remote-python "<remote-python>" \
   "C:\work\remote_file.bin" \
   local_copy.bin
 ```
@@ -749,7 +863,7 @@ Check the remote Python interpreter version:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --program "C:\Python314\python.exe" \
+  --program "<remote-python>" \
   --args=-V \
   --timeout-ms 10000
 ```
@@ -759,7 +873,7 @@ Run a short one-liner on the Windows host:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --program "C:\Python314\python.exe" \
+  --program "<remote-python>" \
   --args="-c \"print('hello from host python')\"" \
   --timeout-ms 10000
 ```
@@ -769,7 +883,7 @@ Run a Python script from a working directory:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --program "C:\Python314\python.exe" \
+  --program "<remote-python>" \
   --cwd "C:\work\capture_demo" \
   --args "\"replay_message_replayish.py\" \"message_capture_export.json\" --dry-run" \
   --timeout-ms 20000
@@ -780,7 +894,7 @@ Run the same script for real replay:
 ```text
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
   --x64dbg-url http://<vm-ip>:8888/ \
-  --program "C:\Python314\python.exe" \
+  --program "<remote-python>" \
   --cwd "C:\work\capture_demo" \
   --args "\"replay_message_replayish.py\" \"message_capture_export.json\"" \
   --timeout-ms 30000
@@ -792,7 +906,7 @@ Run asynchronously and inspect later:
 rtk x64dbgvenv/bin/python x64dbg_tools/hostexec_call.py \
   --x64dbg-url http://<vm-ip>:8888/ \
   --mode spawn \
-  --program "C:\Python314\python.exe" \
+  --program "<remote-python>" \
   --cwd "C:\work\capture_demo" \
   --args "\"replay_message_replayish.py\" \"message_capture_export.json\""
 ```
